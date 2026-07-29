@@ -2,26 +2,25 @@ import asyncio
 import base64
 import contextlib
 import copy
-import contextvars
 import hashlib
+import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
-import httpx
+import httpx2
 import mcp.server.stdio
 import uvicorn
 from mcp import types
-from mcp.server import Server
-from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
-from starlette.applications import Starlette
+from mcp.server import CacheHint, Server, ServerRequestContext
+from mcp.shared.exceptions import MCPError
 from starlette.middleware.cors import CORSMiddleware
 from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
-from starlette.types import Receive, Scope, Send
+from starlette.routing import Route
 
 
 logging.basicConfig(
@@ -40,13 +39,29 @@ MCP_HOST = os.getenv("MCP_HOST", "0.0.0.0")
 MCP_PORT = int(os.getenv("MCP_PORT", "8000"))
 MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
 DISCOVERY_TIMEOUT_SECONDS = float(os.getenv("DISCOVERY_TIMEOUT_SECONDS", "30"))
+DISCOVERY_RETRY_SECONDS = float(os.getenv("DISCOVERY_RETRY_SECONDS", "60"))
+TOOL_LIST_TTL_MS = int(os.getenv("TOOL_LIST_TTL_MS", "300000"))
+CORS_ALLOW_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
+    if origin.strip()
+]
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
 STATUS_TOOL_NAME = "nextcloud_discovery_status"
-INTERNAL_HEADER_PARAMS = {"ocs-apirequest"}
+INTERNAL_HEADER_PARAMS = {"ocs-apirequest", "authorization"}
 SERVER_NAME = "nextcloud-live-instance-mcp"
+SERVER_VERSION = "2.0.0"
 NEXTCLOUD_USERNAME_HEADER = "x-nextcloud-username"
 NEXTCLOUD_APP_TOKEN_HEADER = "x-nextcloud-apptoken"
+SAFE_RESPONSE_HEADERS = {
+    "content-type",
+    "content-length",
+    "etag",
+    "last-modified",
+    "location",
+    "retry-after",
+}
 
 
 @dataclass(slots=True)
@@ -73,6 +88,7 @@ class DiscoveryState:
     apps: list[dict[str, Any]] = field(default_factory=list)
     last_refresh: str | None = None
     last_error: str | None = None
+    last_attempt: float | None = None
 
 
 @dataclass(slots=True)
@@ -82,11 +98,8 @@ class AuthContext:
     cache_key: str
 
 
-REQUEST_HEADERS: contextvars.ContextVar[dict[str, str]] = contextvars.ContextVar(
-    "request_headers",
-    default={},
-)
 DISCOVERY_STATE = DiscoveryState()
+DISCOVERY_LOCK = asyncio.Lock()
 
 
 def now_iso() -> str:
@@ -289,8 +302,7 @@ def default_auth_context() -> AuthContext:
     return AuthContext(auth_header=None, source="none", cache_key="anonymous")
 
 
-def request_auth_context() -> AuthContext:
-    headers = REQUEST_HEADERS.get()
+def header_auth_context(headers: Any) -> AuthContext:
     username = headers.get(NEXTCLOUD_USERNAME_HEADER)
     app_token = headers.get(NEXTCLOUD_APP_TOKEN_HEADER)
     if username and app_token:
@@ -300,8 +312,20 @@ def request_auth_context() -> AuthContext:
             source="request_basic_headers",
             cache_key=f"request:{hash_auth_value(auth_header)}",
         )
-
     return AuthContext(auth_header=None, source="none", cache_key="anonymous")
+
+
+def execution_auth_context(ctx: ServerRequestContext[Any, Any]) -> AuthContext:
+    """Credentials used to proxy a tool call.
+
+    On HTTP the server is shared, so only the caller's own request headers are
+    trusted and there is no fallback to the startup account. On stdio the
+    process belongs to a single local client and carries no headers at all, so
+    the configured environment credentials are the caller's own.
+    """
+    if ctx.request is None:
+        return default_auth_context()
+    return header_auth_context(ctx.request.headers)
 
 
 def build_nextcloud_headers(
@@ -319,7 +343,15 @@ def build_nextcloud_headers(
     return headers
 
 
-async def fetch_json(client: httpx.AsyncClient, url: str, auth_context: AuthContext) -> Any:
+def safe_response_headers(headers: Any) -> dict[str, str]:
+    return {
+        name: value
+        for name, value in headers.items()
+        if name.lower() in SAFE_RESPONSE_HEADERS
+    }
+
+
+async def fetch_json(client: httpx2.AsyncClient, url: str, auth_context: AuthContext) -> Any:
     response = await client.get(url, headers=build_nextcloud_headers(auth_context))
     response.raise_for_status()
     return response.json()
@@ -333,9 +365,9 @@ async def discover_operations(auth_context: AuthContext) -> DiscoveryState:
         )
 
     logger.info("Discovering Nextcloud APIs from %s", API_VIEWER_URL)
-    timeout = httpx.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx2.AsyncClient(timeout=timeout) as client:
         apps = await fetch_json(client, f"{API_VIEWER_URL}/apps", auth_context)
         operations: dict[str, OperationDefinition] = {}
         discovered_apps: list[dict[str, Any]] = []
@@ -389,6 +421,7 @@ async def discover_operations(auth_context: AuthContext) -> DiscoveryState:
         apps=sorted(discovered_apps, key=lambda item: item["id"]),
         last_refresh=now_iso(),
         last_error=None,
+        last_attempt=time.monotonic(),
     )
     logger.info(
         "Discovered %d apps and %d MCP tools",
@@ -402,33 +435,40 @@ def current_state() -> DiscoveryState:
     return DISCOVERY_STATE
 
 
+def discovery_is_current() -> bool:
+    state = DISCOVERY_STATE
+    if state.last_refresh is not None:
+        return True
+    if state.last_error is None or state.last_attempt is None:
+        return False
+    return (time.monotonic() - state.last_attempt) < DISCOVERY_RETRY_SECONDS
+
+
 async def refresh_state(force: bool = False) -> DiscoveryState:
     global DISCOVERY_STATE
 
-    if (
-        not force
-        and (DISCOVERY_STATE.last_refresh is not None or DISCOVERY_STATE.last_error is not None)
-    ):
+    if not force and discovery_is_current():
         return DISCOVERY_STATE
 
-    try:
-        state = await discover_operations(default_auth_context())
-    except Exception as exc:
-        state = DiscoveryState(last_error=str(exc))
-        logger.warning("Discovery failed for auth source %s: %s", default_auth_context().source, exc)
-    DISCOVERY_STATE = state
-    return DISCOVERY_STATE
+    async with DISCOVERY_LOCK:
+        if not force and discovery_is_current():
+            return DISCOVERY_STATE
+
+        try:
+            state = await discover_operations(default_auth_context())
+        except Exception as exc:
+            state = DiscoveryState(last_error=str(exc), last_attempt=time.monotonic())
+            logger.warning("Discovery failed for auth source %s: %s", default_auth_context().source, exc)
+        DISCOVERY_STATE = state
+        return DISCOVERY_STATE
 
 
-def discovery_status_payload() -> dict[str, Any]:
-    request_context = request_auth_context()
+def discovery_status_payload(request_context: AuthContext) -> dict[str, Any]:
     discovery_auth_context = default_auth_context()
     state = current_state()
     return {
         "nextcloud_url": NEXTCLOUD_URL,
         "api_viewer_url": API_VIEWER_URL,
-        "auth_source": discovery_auth_context.source,
-        "auth_configured": discovery_auth_context.auth_header is not None,
         "discovery_auth_source": discovery_auth_context.source,
         "discovery_auth_configured": discovery_auth_context.auth_header is not None,
         "request_auth_source": request_context.source,
@@ -442,6 +482,7 @@ def discovery_status_payload() -> dict[str, Any]:
         "apps": state.apps,
         "last_refresh": state.last_refresh,
         "last_error": state.last_error,
+        "discovery_retry_seconds": DISCOVERY_RETRY_SECONDS,
     }
 
 
@@ -464,7 +505,16 @@ def list_tools() -> list[types.Tool]:
                 "Show the live connected Nextcloud instance, discovery status, "
                 "discovered apps, and available MCP tools."
             ),
-            inputSchema={"type": "object", "properties": {}, "additionalProperties": False},
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "Re-run API discovery before reporting status.",
+                    }
+                },
+                "additionalProperties": False,
+            },
         ),
     ]
 
@@ -472,7 +522,7 @@ def list_tools() -> list[types.Tool]:
         types.Tool(
             name=definition.name,
             description=dynamic_tool_description(definition),
-            inputSchema=definition.input_schema,
+            input_schema=definition.input_schema,
         )
         for definition in sorted(state.operations.values(), key=lambda item: item.name)
     ]
@@ -506,7 +556,7 @@ def build_request_body(definition: OperationDefinition, arguments: dict[str, Any
     return None, None, body
 
 
-def parse_response_body(response: httpx.Response) -> dict[str, Any]:
+def parse_response_body(response: httpx2.Response) -> dict[str, Any]:
     content_type = response.headers.get("content-type", "").lower()
 
     if "json" in content_type:
@@ -524,15 +574,11 @@ def parse_response_body(response: httpx.Response) -> dict[str, Any]:
     }
 
 
-async def execute_operation(definition: OperationDefinition, arguments: dict[str, Any]) -> dict[str, Any]:
-    auth_context = request_auth_context()
-    if not auth_context.auth_header:
-        raise ValueError(
-            "Missing request credentials for this tool call. Configure MCP HTTP headers "
-            "`X-Nextcloud-Username` and `X-Nextcloud-AppToken`. "
-            "Server discovery credentials are not used for tool execution."
-        )
-
+async def execute_operation(
+    definition: OperationDefinition,
+    arguments: dict[str, Any],
+    auth_context: AuthContext,
+) -> dict[str, Any]:
     actual_path = definition.path
     for parameter_name in definition.path_params:
         if parameter_name not in arguments:
@@ -557,9 +603,9 @@ async def execute_operation(definition: OperationDefinition, arguments: dict[str
         headers["Content-Type"] = definition.body_content_type
 
     url = f"{NEXTCLOUD_URL}{actual_path}"
-    timeout = httpx.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx2.AsyncClient(timeout=timeout) as client:
         response = await client.request(
             method=definition.method,
             url=url,
@@ -578,101 +624,127 @@ async def execute_operation(definition: OperationDefinition, arguments: dict[str
         "method": definition.method,
         "path": definition.path,
         "resolved_url": url,
-        "response_headers": dict(response.headers),
+        "response_headers": safe_response_headers(response.headers),
     }
     payload.update(parse_response_body(response))
     return payload
 
 
-server = Server(
-    SERVER_NAME,
-)
+def tool_result(payload: dict[str, Any], is_error: bool = False) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(payload, ensure_ascii=False, default=str))],
+        structured_content=payload,
+        is_error=is_error,
+    )
 
 
-@server.list_tools()
-async def handle_list_tools() -> list[types.Tool]:
+async def on_list_tools(
+    ctx: ServerRequestContext[Any, Any],
+    params: types.PaginatedRequestParams | None,
+) -> types.ListToolsResult:
     await refresh_state()
-    return list_tools()
+    return types.ListToolsResult(tools=list_tools())
 
 
-@server.call_tool()
-async def handle_call_tool(
-    tool_name: str,
-    arguments: dict[str, Any],
-) -> types.CallToolResult | dict[str, Any]:
-    if tool_name == STATUS_TOOL_NAME:
-        return discovery_status_payload()
+async def on_call_tool(
+    ctx: ServerRequestContext[Any, Any],
+    params: types.CallToolRequestParams,
+) -> types.CallToolResult:
+    arguments = params.arguments or {}
+    auth_context = execution_auth_context(ctx)
+
+    if params.name == STATUS_TOOL_NAME:
+        if arguments.get("refresh"):
+            await refresh_state(force=True)
+        return tool_result(discovery_status_payload(auth_context))
 
     state = await refresh_state()
-    definition = state.operations.get(tool_name)
+    definition = state.operations.get(params.name)
     if definition is None:
-        raise ValueError(f"Unknown tool: {tool_name}")
+        raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {params.name}")
 
-    payload = await execute_operation(definition, arguments)
-    return payload
+    if not auth_context.auth_header:
+        return tool_result(
+            {
+                "ok": False,
+                "error": (
+                    "Missing request credentials for this tool call. Configure MCP HTTP headers "
+                    "`X-Nextcloud-Username` and `X-Nextcloud-AppToken`. "
+                    "Server discovery credentials are not used for tool execution over HTTP."
+                ),
+                "tool_name": params.name,
+            },
+            is_error=True,
+        )
 
-
-session_manager = StreamableHTTPSessionManager(
-    app=server,
-    event_store=None,
-    json_response=True,
-    stateless=True,
-)
-
-
-async def handle_streamable_http(scope: Scope, receive: Receive, send: Send) -> None:
-    headers = {
-        key.decode("latin-1").lower(): value.decode("latin-1")
-        for key, value in scope.get("headers", [])
-    }
-    token = REQUEST_HEADERS.set(headers)
     try:
-        await session_manager.handle_request(scope, receive, send)
-    finally:
-        REQUEST_HEADERS.reset(token)
+        payload = await execute_operation(definition, arguments, auth_context)
+    except ValueError as exc:
+        return tool_result({"ok": False, "error": str(exc), "tool_name": params.name}, is_error=True)
+    return tool_result(payload)
+
+
+@contextlib.asynccontextmanager
+async def server_lifespan(_server):
+    await refresh_state(force=True)
+    yield {}
+
+
+server = Server(
+    SERVER_NAME,
+    version=SERVER_VERSION,
+    title="Nextcloud Live Instance MCP",
+    description="Exposes the APIs of a connected Nextcloud instance as MCP tools.",
+    lifespan=server_lifespan,
+    on_list_tools=on_list_tools,
+    on_call_tool=on_call_tool,
+    cache_hints={"tools/list": CacheHint(ttl_ms=TOOL_LIST_TTL_MS, scope="private")},
+)
 
 
 async def healthcheck(_request) -> JSONResponse:
+    state = current_state()
     return JSONResponse(
         {
             "name": "Nextcloud Live Instance MCP",
             "server_name": SERVER_NAME,
-            "transport": "streamable-http",
+            "server_version": SERVER_VERSION,
             "mcp_path": "/mcp",
-            "default_auth_configured": default_auth_context().auth_header is not None,
-            **discovery_status_payload(),
+            "discovery_auth_configured": default_auth_context().auth_header is not None,
+            "discovery_ok": state.last_refresh is not None and state.last_error is None,
+            "app_count": len(state.apps),
+            "tool_count": len(state.operations),
+            "last_refresh": state.last_refresh,
         },
         status_code=200,
     )
 
 
-@contextlib.asynccontextmanager
-async def lifespan(_app: Starlette):
-    async with session_manager.run():
-        await refresh_state(force=True)
-        yield
+def build_mcp_app():
+    return server.streamable_http_app(
+        streamable_http_path="/mcp",
+        json_response=True,
+        stateless_http=True,
+        host=MCP_HOST,
+        debug=os.getenv("DEBUG", "").lower() == "true",
+        custom_starlette_routes=[Route("/", endpoint=healthcheck, methods=["GET"])],
+    )
 
 
-app = Starlette(
-    debug=os.getenv("DEBUG", "").lower() == "true",
-    routes=[
-        Route("/", endpoint=healthcheck, methods=["GET"]),
-        Mount("/mcp", app=handle_streamable_http),
-    ],
-    lifespan=lifespan,
-)
+def wrap_cors(asgi_app):
+    return CORSMiddleware(
+        asgi_app,
+        allow_origins=CORS_ALLOW_ORIGINS,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["*"],
+    )
 
-app = CORSMiddleware(
-    app,
-    allow_origins=["*"],
-    allow_methods=["GET", "POST", "DELETE"],
-    allow_headers=["*"],
-    expose_headers=["Mcp-Session-Id"],
-)
+
+mcp_app = build_mcp_app()
+app = wrap_cors(mcp_app)
 
 
 async def run_stdio() -> None:
-    await refresh_state(force=True)
     async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
         await server.run(
             read_stream,

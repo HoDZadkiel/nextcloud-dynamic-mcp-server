@@ -4,6 +4,8 @@ This server exposes a live Nextcloud instance as an MCP server - flexibile for a
 
 Instead of shipping a fixed tool list, it queries the Nextcloud `ocs_api_viewer` app at startup, reads the OpenAPI descriptions for installed apps, and turns those operations into MCP tools dynamically. The result is an MCP endpoint that reflects the APIs available on the connected Nextcloud instance.
 
+Speaks MCP protocol revision `2026-07-28` (the stateless core) on the modern Streamable HTTP path, and still answers the older handshake revisions for clients that have not migrated yet.
+
 ## What The Server Does
 
 - Connects to a Nextcloud instance defined by `NEXTCLOUD_URL`
@@ -15,7 +17,7 @@ Instead of shipping a fixed tool list, it queries the Nextcloud `ocs_api_viewer`
 
 One built-in tool is always available:
 
-- `nextcloud_discovery_status`: returns the connected Nextcloud URL, auth mode, discovered apps, tool count, and last refresh/error state
+- `nextcloud_discovery_status`: returns the connected Nextcloud URL, auth mode, discovered apps, tool count, and last refresh/error state. Pass `{"refresh": true}` to re-run discovery first.
 
 Dynamic tools are named from the Nextcloud app id plus the OpenAPI operation id or path, for example:
 
@@ -29,13 +31,9 @@ dav_upcoming_events_get_events
 
 ### `GET /`
 
-Health and discovery endpoint. Returns:
+Health endpoint. Returns the server name and version, the MCP path, whether discovery credentials are configured, whether the last discovery succeeded, and the app/tool counts.
 
-- server name
-- transport mode
-- MCP path
-- whether default credentials are configured
-- current discovery status
+It deliberately does **not** return the Nextcloud URL, the installed-app inventory, or discovery error text: this endpoint is reachable cross-origin and those fields describe an internal instance. Call the `nextcloud_discovery_status` tool for the full picture.
 
 Example:
 
@@ -59,6 +57,7 @@ http://localhost:8000/mcp
 - A reachable Nextcloud instance
 - The Nextcloud `ocs_api_viewer` app enabled on that instance
 - A Nextcloud username and app token with permission to access the APIs you want to expose
+- An MCP client that speaks revision `2026-07-28` (or an older handshake revision)
 
 ## Configuration
 
@@ -73,8 +72,17 @@ The server is configured entirely with environment variables.
 | `MCP_PORT` | `8000` | Bind port for HTTP mode |
 | `MCP_TRANSPORT` | `streamable-http` | `streamable-http` or `stdio` |
 | `DISCOVERY_TIMEOUT_SECONDS` | `30` | Timeout for discovery and proxied requests |
+| `DISCOVERY_RETRY_SECONDS` | `60` | How long a failed discovery is cached before it is retried |
+| `TOOL_LIST_TTL_MS` | `300000` | `ttlMs` cache hint sent with `tools/list` results |
+| `CORS_ALLOW_ORIGINS` | unset | Comma-separated browser origins allowed to read responses. `*` allows all |
 | `LOG_LEVEL` | `INFO` | Python log level |
 | `DEBUG` | unset | Set to `true` to enable Starlette debug mode |
+
+### Browser Origins
+
+`CORS_ALLOW_ORIGINS` only affects MCP clients that run **inside a browser**. CORS is enforced by browsers, so command-line and native clients (Codex, Claude Code, anything using an HTTP library) are unaffected by this setting and need no configuration.
+
+Leaving it unset means no cross-origin page can read this server's responses. Set it to the origin of your browser-based client if you have one.
 
 ### Authentication Modes
 
@@ -85,7 +93,11 @@ The server supports two auth patterns:
    - `X-Nextcloud-Username`
    - `X-Nextcloud-AppToken`
 
-The server-level credentials are used only during startup discovery. Every actual tool call must provide the request headers, and the server does not fall back to the startup admin credentials for execution.
+Over HTTP the server-level credentials are used only during startup discovery. Every tool call must provide the request headers, and the server does not fall back to the startup admin credentials for execution - one shared server URL never lets one caller act as another.
+
+Over `stdio` there are no HTTP headers and the process serves exactly one local client, so tool calls use the configured `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN`.
+
+Proxied responses return only a safe subset of the upstream response headers (`content-type`, `content-length`, `etag`, `last-modified`, `location`, `retry-after`). Nextcloud answers Basic-auth requests with a session cookie, and forwarding it would put a live session token into the MCP client's conversation.
 
 ## How To Start The Server
 
@@ -113,9 +125,9 @@ At startup, the server:
 
 Discovery uses the server's default `NEXTCLOUD_USERNAME` and `NEXTCLOUD_APP_TOKEN`.
 
-Every tool execution uses only `X-Nextcloud-Username` and `X-Nextcloud-AppToken`. If those headers are missing, the tool call is rejected instead of falling back to the startup admin account.
+Every tool execution over HTTP uses only `X-Nextcloud-Username` and `X-Nextcloud-AppToken`. If those headers are missing, the tool call is rejected instead of falling back to the startup admin account.
 
-If discovery fails, the server still starts and reports the error through `nextcloud_discovery_status` and `GET /`.
+If discovery fails, the server still starts and reports the error through `nextcloud_discovery_status`. A failed discovery is retried after `DISCOVERY_RETRY_SECONDS`, so a server that starts before Nextcloud is reachable recovers on its own; `nextcloud_discovery_status` with `{"refresh": true}` forces a retry immediately.
 
 ## Client Configuration Examples
 
@@ -181,3 +193,12 @@ In an MCP client, call:
 - `nextcloud_discovery_status`
 
 Then verify that the discovered tool list includes operations from your enabled Nextcloud apps.
+
+## Tests
+
+```bash
+pip install -r requirements-dev.txt
+pytest
+```
+
+The suite covers schema generation, credential handling, discovery retry, and the `2026-07-28` protocol surface (`server/discover`, cache hints, per-request auth) against the in-process ASGI app. Proxying against a real Nextcloud instance is not covered.
