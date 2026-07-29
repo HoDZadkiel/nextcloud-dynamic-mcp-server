@@ -26,6 +26,7 @@
 - 新增 `test_main.py`（18 個測試）、`requirements-dev.txt`、`.gitignore`
 - `README.md`：更新協議版本、新增環境變數、CORS 說明、stdio 認證行為、測試章節
 - `.env`：使用者提供的本機驗證用檔案，未納入版控（`.gitignore` 已排除）。程式維持原本的環境變數形式，**不**讀取 `.env`；`docker-compose.yml` 保留原本寫死的 `environment:` 區塊。
+- `README.md`：全文重寫。新增 Attribution 區塊註明來源為 `Rello/nextcloud-dynamic-mcp-server`（並載明上游無 LICENSE、授權條款屬上游作者），新增 "What This Fork Changes" 區塊逐項列出與上游 `bc2c042` 的差異，並補上「寫入類工具未經測試」的警語。
 
 ### 問題與解法（Problems & Solutions）
 
