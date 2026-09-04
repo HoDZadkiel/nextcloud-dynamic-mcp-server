@@ -10,7 +10,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, unquote
+from xml.etree import ElementTree
 
 import httpx2
 import mcp.server.stdio
@@ -53,11 +54,20 @@ STATUS_TOOL_NAME = "nextcloud_discovery_status"
 FIND_TOOL_NAME = "nextcloud_find_operations"
 DESCRIBE_TOOL_NAME = "nextcloud_describe_operations"
 CALL_TOOL_NAME = "nextcloud_call_operation"
-READ_FILE_TOOL_NAME = "nextcloud_read_file"
-WRITE_FILE_TOOL_NAME = "nextcloud_write_file"
-# Files live outside the OCS API that ocs_api_viewer describes, so these two
-# tools are hand-written rather than discovered. See `WebDAV` in the README.
+WEBDAV_APP_ID = "webdav"
+# Files live outside the OCS API that ocs_api_viewer describes, so the webdav_*
+# operations are hand-written rather than discovered. See `WebDAV` in the README.
 WEBDAV_ROOT = "/remote.php/dav/files"
+ETAG_ENCODING_SUFFIXES = ("-gzip", "-br", "-deflate", "-zstd")
+# Only the properties the tools actually report; asking for allprop would drag
+# in Nextcloud's whole custom property set for no gain.
+PROPFIND_BODY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<d:propfind xmlns:d="DAV:"><d:prop>'
+    "<d:resourcetype/><d:getcontentlength/><d:getcontenttype/>"
+    "<d:getlastmodified/><d:getetag/>"
+    "</d:prop></d:propfind>"
+)
 FIND_DEFAULT_LIMIT = 30
 FIND_MAX_LIMIT = 200
 SUGGESTION_LIMIT = 5
@@ -92,6 +102,9 @@ class OperationDefinition:
     body_mode: str
     body_fields: list[str]
     body_content_type: str | None
+    # Set only on the hand-written WebDAV entries, which are answered locally
+    # instead of being proxied to an OCS endpoint. See BUILTIN_OPERATIONS.
+    handler: str | None = None
 
 
 @dataclass(slots=True)
@@ -531,6 +544,13 @@ def current_state() -> DiscoveryState:
     return DISCOVERY_STATE
 
 
+def all_operations() -> dict[str, OperationDefinition]:
+    """The catalogue as callers see it: what discovery found, plus the
+    hand-written WebDAV entries. Built-ins are merged at read time rather than
+    written into DiscoveryState, so a refresh cannot drop them."""
+    return {**BUILTIN_OPERATIONS, **current_state().operations}
+
+
 def discovery_is_current() -> bool:
     state = DISCOVERY_STATE
     if state.last_refresh is not None:
@@ -581,7 +601,7 @@ def discovery_status_payload(request_context: AuthContext) -> dict[str, Any]:
             "X-Nextcloud-AppToken",
         ],
         "app_count": len(state.apps),
-        "tool_count": len(state.operations),
+        "tool_count": len(all_operations()),
         "last_refresh": state.last_refresh,
         "discovery_ok": state.last_refresh is not None and state.last_error is None,
         "discovery_retry_seconds": DISCOVERY_RETRY_SECONDS,
@@ -635,7 +655,7 @@ def search_operations(
     app_filter = (app or "").strip().lower()
 
     scored: list[tuple[int, str, OperationDefinition]] = []
-    for definition in current_state().operations.values():
+    for definition in all_operations().values():
         if app_filter and definition.app_id.lower() != app_filter:
             continue
         if not all(term in operation_haystack(definition) for term in terms):
@@ -659,7 +679,7 @@ def suggest_operation_names(name: Any) -> list[str]:
         return []
 
     scored: list[tuple[int, str]] = []
-    for definition in current_state().operations.values():
+    for definition in all_operations().values():
         score = term_score(definition, terms)
         if score:
             scored.append((-score, definition.name))
@@ -669,10 +689,11 @@ def suggest_operation_names(name: Any) -> list[str]:
 
 
 def app_index() -> str:
-    apps = current_state().apps
-    if not apps:
-        return f"none discovered yet - call {STATUS_TOOL_NAME}"
-    return ", ".join(f"{app['id']}:{app['operation_count']}" for app in apps)
+    """Includes the built-in `webdav` app, which is not discovered and would
+    otherwise be invisible to anyone who did not already know it was there."""
+    entries = [f"{WEBDAV_APP_ID}:{len(BUILTIN_OPERATIONS)}"]
+    entries += [f"{app['id']}:{app['operation_count']}" for app in current_state().apps]
+    return ", ".join(entries)
 
 
 def find_tool_description(authenticated: bool) -> str:
@@ -695,7 +716,7 @@ def find_tool_description(authenticated: bool) -> str:
             "request headers."
         )
     return (
-        f"Search the {len(current_state().operations)} live Nextcloud API operations "
+        f"Search the {len(all_operations())} live Nextcloud API operations "
         f"available on the connected instance and return their names, HTTP method, "
         f"path and summary. {shared} "
         f"Apps on this instance (id:operations) - {app_index()}."
@@ -805,67 +826,6 @@ def list_tools(authenticated: bool = False) -> list[types.Tool]:
                 "additionalProperties": False,
             },
         ),
-        types.Tool(
-            name=READ_FILE_TOOL_NAME,
-            description=(
-                "Read a file from the caller's Nextcloud files over WebDAV, and return "
-                "its contents plus an ETag. Use this for anything the OCS API only "
-                "describes rather than serves - notably the body of a Collectives page, "
-                "which the collectives operations report metadata for but never return. "
-                "Compose a page's path from its own index entry: "
-                "`{collectivePath}/{filePath}/{fileName}`, dropping `filePath` when it "
-                "is empty - e.g. `.Collectives/Handbook/SAM/notes.md`. "
-                "Binary files come back base64-encoded in `data_base64`."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": (
-                            "Path relative to the caller's files root, without a leading "
-                            "slash. `.` and `..` segments are rejected."
-                        ),
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": False,
-            },
-        ),
-        types.Tool(
-            name=WRITE_FILE_TOOL_NAME,
-            description=(
-                f"Replace a file's contents over WebDAV, writing UTF-8 text. This "
-                f"overwrites the whole file, so read it with `{READ_FILE_TOOL_NAME}` "
-                f"first and send back the `etag` you got as `if_match` - the write then "
-                f"fails with 412 instead of discarding an edit somebody made in between. "
-                f"The parent folder must already exist: to add a Collectives page, create "
-                f"it with `collectives_page_create` through `{CALL_TOOL_NAME}` and write "
-                f"its body here."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Path relative to the caller's files root.",
-                    },
-                    "content": {
-                        "type": "string",
-                        "description": "The complete new contents of the file.",
-                    },
-                    "if_match": {
-                        "type": "string",
-                        "description": (
-                            f"ETag from a prior `{READ_FILE_TOOL_NAME}`. Omit only when "
-                            f"deliberately overwriting whatever is there."
-                        ),
-                    },
-                },
-                "required": ["path", "content"],
-                "additionalProperties": False,
-            },
-        ),
     ]
 
 
@@ -969,28 +929,103 @@ async def execute_operation(
     return payload
 
 
-def webdav_url(auth_context: AuthContext, path: str) -> str:
-    """Resolve a user-relative path to its WebDAV URL.
+def webdav_path_segments(path: str, allow_root: bool = False) -> list[str]:
+    """Split a user-relative path, rejecting traversal.
 
-    `.` and `..` are rejected rather than normalised: the caller is already
+    `.` and `..` are refused rather than normalised: the caller is already
     confined to their own files by Basic auth, but a traversal could still climb
     out of `/remote.php/dav/files/<user>/` and address other DAV endpoints.
-    Each segment is encoded separately so that spaces and non-ASCII names -
-    `.Collectives/研究筆記/第一章 概論/…` is an ordinary shape here - survive intact
-    the separators stay literal.
     """
-    if not auth_context.username:
-        raise ValueError("Cannot resolve a WebDAV path without the caller's username")
-
     segments = [segment for segment in str(path or "").replace("\\", "/").split("/") if segment]
-    if not segments:
+    if not segments and not allow_root:
         raise ValueError("Path is required")
     for segment in segments:
         if segment in (".", ".."):
             raise ValueError(f"Path segment not allowed: {segment}")
+    return segments
 
-    encoded = "/".join(quote(segment, safe="") for segment in segments)
-    return f"{NEXTCLOUD_URL}{WEBDAV_ROOT}/{quote(auth_context.username, safe='')}/{encoded}"
+
+def webdav_url(auth_context: AuthContext, path: str, allow_root: bool = False) -> str:
+    """Resolve a user-relative path to its WebDAV URL.
+
+    Each segment is encoded separately so that spaces and non-ASCII names -
+    `.Collectives/研究筆記/第一章 概論/…` is an ordinary shape here - survive intact
+    while the separators stay literal.
+    """
+    if not auth_context.username:
+        raise ValueError("Cannot resolve a WebDAV path without the caller's username")
+
+    root = f"{NEXTCLOUD_URL}{WEBDAV_ROOT}/{quote(auth_context.username, safe='')}"
+    segments = webdav_path_segments(path, allow_root=allow_root)
+    if not segments:
+        return root
+    return f"{root}/" + "/".join(quote(segment, safe="") for segment in segments)
+
+
+def parse_propfind(body: str, auth_context: AuthContext) -> list[dict[str, Any]]:
+    """Turn a PROPFIND multistatus into plain entries.
+
+    Paths are reported back relative to the user's files root, so that whatever
+    comes out of a listing can be fed straight into the other file tools without
+    the caller having to strip `/remote.php/dav/files/<user>/` by hand.
+    """
+    dav = "{DAV:}"
+    prefix = f"{WEBDAV_ROOT}/{quote(auth_context.username or '', safe='')}"
+    try:
+        root = ElementTree.fromstring(body)
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"Could not parse the PROPFIND response: {exc}") from exc
+
+    entries: list[dict[str, Any]] = []
+    for element in root.findall(f"{dav}response"):
+        href = (element.findtext(f"{dav}href") or "").strip()
+        relative = unquote(href)
+        if relative.startswith(prefix):
+            relative = relative[len(prefix):]
+        relative = relative.strip("/")
+
+        properties = element.find(f"{dav}propstat/{dav}prop")
+        if properties is None:
+            continue
+        size = properties.findtext(f"{dav}getcontentlength")
+        entries.append(
+            {
+                "path": relative,
+                "name": relative.rsplit("/", 1)[-1],
+                "is_folder": properties.find(f"{dav}resourcetype/{dav}collection") is not None,
+                "size": int(size) if size and size.isdigit() else None,
+                "content_type": properties.findtext(f"{dav}getcontenttype") or None,
+                "last_modified": properties.findtext(f"{dav}getlastmodified") or None,
+                "etag": normalize_etag(properties.findtext(f"{dav}getetag")),
+            }
+        )
+    return entries
+
+
+def normalize_etag(etag: str | None) -> str | None:
+    """Strip the transfer-encoding suffix a compressing server appends.
+
+    Apache and nginx mangle the ETag when they compress a response: the entity
+    whose validator is `"abc"` comes back from a GET as `"abc-gzip"`. Handing
+    that straight back as `If-Match` is refused with 412 even though nothing
+    changed, and the obvious recovery - read again, retry - returns the same
+    mangled value and fails identically, forever. Observed against a live
+    instance, so the whole guarded-write workflow is unusable behind a
+    compressing proxy without this.
+    """
+    if not etag:
+        return etag
+
+    prefix, value = ("W/", etag[2:]) if etag.startswith("W/") else ("", etag)
+    if len(value) < 2 or not (value.startswith('"') and value.endswith('"')):
+        return etag
+
+    inner = value[1:-1]
+    for suffix in ETAG_ENCODING_SUFFIXES:
+        if inner.endswith(suffix):
+            inner = inner[: -len(suffix)]
+            break
+    return f'{prefix}"{inner}"'
 
 
 def build_webdav_headers(
@@ -1005,6 +1040,28 @@ def build_webdav_headers(
     return headers
 
 
+def missing_parent_error(path: str) -> str:
+    return (
+        f"No parent folder for `{path}`. Nextcloud answers a write below a missing "
+        f"folder with 404, not the 409 the WebDAV spec suggests. Create the folder "
+        "with `webdav_create_folder` first, or check the path for a typo."
+    )
+
+
+def looks_like_a_collection(response: httpx2.Response) -> bool:
+    """Decide whether a successful GET actually addressed a folder.
+
+    WebDAV leaves GET on a collection undefined and Nextcloud answers it with
+    200 and an HTML blurb about the WebDAV interface, so an unguarded read of a
+    folder path returns a plausible-looking file whose contents are that
+    sentence. Files always carry an ETag here and this page never does, which is
+    the cheap half of the signal; the HTML content type is the other half.
+    """
+    if not response.is_success or response.headers.get("etag"):
+        return False
+    return "text/html" in response.headers.get("content-type", "").lower()
+
+
 async def read_file(auth_context: AuthContext, path: str) -> dict[str, Any]:
     url = webdav_url(auth_context, path)
     timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
@@ -1012,23 +1069,57 @@ async def read_file(auth_context: AuthContext, path: str) -> dict[str, Any]:
     async with httpx2.AsyncClient(timeout=timeout) as client:
         response = await client.get(url, headers=build_webdav_headers(auth_context))
 
+    if looks_like_a_collection(response):
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "path": path,
+            "error": (
+                f"`{path}` is a folder, not a file. Nextcloud answers a folder read "
+                f"with 200 and a placeholder page rather than an error, so this would "
+                f"otherwise look like a successful read. Use "
+                "`webdav_list_directory` to see what is inside it."
+            ),
+        }
+
     payload = {
         "ok": response.is_success,
         "status_code": response.status_code,
         "path": path,
         # Carry the ETag out so it can be handed straight back as `if_match`.
-        "etag": response.headers.get("etag"),
+        "etag": normalize_etag(response.headers.get("etag")),
         "response_headers": safe_response_headers(response.headers),
     }
+    if response.status_code == 404:
+        payload["error"] = f"No file at `{path}`."
     payload.update(parse_response_body(response))
     return payload
+
+
+def write_payload_bytes(content: Any, content_base64: str | None) -> bytes:
+    """Resolve the two mutually exclusive body inputs to bytes.
+
+    `content_base64` exists because reads hand binary back base64-encoded. With
+    only a text field, feeding that straight back writes the base64 *text* to the
+    file and the next read encodes it a second time - a silent round-trip
+    corruption that reports success at every step.
+    """
+    if content_base64 is not None:
+        if content:
+            raise ValueError("Pass either `content` or `content_base64`, not both")
+        try:
+            return base64.b64decode(content_base64, validate=True)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"`content_base64` is not valid base64: {exc}") from exc
+    return str(content or "").encode("utf-8")
 
 
 async def write_file(
     auth_context: AuthContext,
     path: str,
-    content: str,
+    content: Any = None,
     if_match: str | None = None,
+    content_base64: str | None = None,
 ) -> dict[str, Any]:
     """Replace a file's contents.
 
@@ -1037,22 +1128,24 @@ async def write_file(
     of silently discarding whatever changed in between - the difference between
     a lost paragraph and a retry.
     """
+    body = write_payload_bytes(content, content_base64)
     url = webdav_url(auth_context, path)
-    extra_headers = {"If-Match": if_match} if if_match else None
+    extra_headers = {"If-Match": normalize_etag(if_match)} if if_match else None
     timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
 
     async with httpx2.AsyncClient(timeout=timeout) as client:
         response = await client.put(
             url,
             headers=build_webdav_headers(auth_context, extra_headers),
-            content=str(content).encode("utf-8"),
+            content=body,
         )
 
     payload: dict[str, Any] = {
         "ok": response.is_success,
         "status_code": response.status_code,
         "path": path,
-        "etag": response.headers.get("etag"),
+        "bytes_written": len(body) if response.is_success else 0,
+        "etag": normalize_etag(response.headers.get("etag")),
         "response_headers": safe_response_headers(response.headers),
     }
     if response.status_code == 412:
@@ -1060,14 +1153,302 @@ async def write_file(
             "The file changed since the `if_match` ETag was read. Read it again, "
             "reapply the edit to the current content, and retry."
         )
-    elif response.status_code == 409:
-        payload["error"] = (
-            "The parent folder does not exist. WebDAV does not create it; make the "
-            "page or folder through its own API first, then write the content."
-        )
+    elif response.status_code in (404, 409):
+        payload["error"] = missing_parent_error(path)
     elif not response.is_success:
         payload.update(parse_response_body(response))
     return payload
+
+
+async def create_folder(
+    auth_context: AuthContext,
+    path: str,
+    parents: bool = True,
+) -> dict[str, Any]:
+    """Create a folder, optionally the whole chain leading to it.
+
+    MKCOL makes exactly one level and fails with 409 when an intermediate is
+    missing, which is the same dead end a write hits. Walking the chain is what
+    makes uploading a directory tree possible at all. An existing folder answers
+    405; that is reported as success with `created: false` so a caller looping
+    over a tree does not have to distinguish "made it" from "already there".
+    """
+    segments = webdav_path_segments(path)
+    targets = [segments] if not parents else [segments[: i + 1] for i in range(len(segments))]
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+    created: list[str] = []
+    existed: list[str] = []
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        for target in targets:
+            target_path = "/".join(target)
+            response = await client.request(
+                "MKCOL",
+                webdav_url(auth_context, target_path),
+                headers=build_webdav_headers(auth_context),
+            )
+            if response.is_success:
+                created.append(target_path)
+            elif response.status_code == 405:
+                existed.append(target_path)
+            else:
+                payload = {
+                    "ok": False,
+                    "status_code": response.status_code,
+                    "path": path,
+                    "failed_at": target_path,
+                    "created": created,
+                }
+                if response.status_code == 409:
+                    payload["error"] = (
+                        f"`{target_path}` has no parent folder. Retry with "
+                        f"`parents` set to true to create the whole chain."
+                    )
+                else:
+                    payload.update(parse_response_body(response))
+                return payload
+
+    return {
+        "ok": True,
+        "status_code": 201 if created else 405,
+        "path": path,
+        "created": created,
+        "already_existed": existed,
+    }
+
+
+async def delete_path(
+    auth_context: AuthContext,
+    path: str,
+    recursive: bool = False,
+) -> dict[str, Any]:
+    """Delete a file, or a folder and everything under it.
+
+    WebDAV DELETE on a collection is unconditionally recursive - there is no
+    shallow variant to fall back on - so the resource is inspected first and a
+    folder is refused unless `recursive` says so explicitly. One extra round trip
+    is a cheap price for not letting a mistyped path take a subtree with it.
+    """
+    url = webdav_url(auth_context, path)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        probe = await client.request(
+            "PROPFIND",
+            url,
+            headers=build_webdav_headers(auth_context, {"Depth": "0"}),
+            content=PROPFIND_BODY,
+        )
+        if probe.status_code == 404:
+            return {"ok": False, "status_code": 404, "path": path, "error": f"Nothing at `{path}`."}
+
+        entries = parse_propfind(probe.text, auth_context)
+        is_collection = bool(entries and entries[0]["is_folder"])
+        if is_collection and not recursive:
+            return {
+                "ok": False,
+                "status_code": probe.status_code,
+                "path": path,
+                "is_folder": True,
+                "error": (
+                    f"`{path}` is a folder. Deleting it removes everything inside, and "
+                    f"WebDAV offers no shallow delete, so pass `recursive` as true to "
+                    f"confirm that is intended."
+                ),
+            }
+
+        response = await client.request("DELETE", url, headers=build_webdav_headers(auth_context))
+
+    payload: dict[str, Any] = {
+        "ok": response.is_success,
+        "status_code": response.status_code,
+        "path": path,
+        "is_folder": is_collection,
+    }
+    if not response.is_success:
+        payload.update(parse_response_body(response))
+    return payload
+
+
+async def list_directory(auth_context: AuthContext, path: str = "") -> dict[str, Any]:
+    """List a folder's immediate children, files included.
+
+    `files_api_get_folder_tree` in the discovered catalogue returns folders only,
+    so it cannot answer "what is in here" - PROPFIND can.
+    """
+    url = webdav_url(auth_context, path, allow_root=True)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.request(
+            "PROPFIND",
+            url,
+            headers=build_webdav_headers(auth_context, {"Depth": "1"}),
+            content=PROPFIND_BODY,
+        )
+
+    if not response.is_success:
+        payload: dict[str, Any] = {"ok": False, "status_code": response.status_code, "path": path}
+        if response.status_code == 404:
+            payload["error"] = f"No folder at `{path}`."
+        else:
+            payload.update(parse_response_body(response))
+        return payload
+
+    entries = parse_propfind(response.text, auth_context)
+    # The first entry is the folder itself; the caller asked what is inside it.
+    return {
+        "ok": True,
+        "status_code": response.status_code,
+        "path": path,
+        "entries": entries[1:],
+    }
+
+
+WEBDAV_HANDLERS = {
+    "read_file": read_file,
+    "write_file": write_file,
+    "list_directory": list_directory,
+    "create_folder": create_folder,
+    "delete_path": delete_path,
+}
+
+PATH_PROPERTY = {"type": "string", "description": "Path relative to the caller's files root."}
+
+
+def builtin_operation(
+    name: str,
+    method: str,
+    handler: str,
+    summary: str,
+    description: str,
+    properties: dict[str, Any],
+    required: list[str],
+) -> OperationDefinition:
+    return OperationDefinition(
+        name=name,
+        app_id=WEBDAV_APP_ID,
+        app_name="WebDAV files",
+        method=method,
+        path=f"{WEBDAV_ROOT}/{{user}}/{{path}}",
+        summary=summary,
+        description=description,
+        input_schema={
+            "type": "object",
+            "properties": properties,
+            "required": required,
+            "additionalProperties": False,
+        },
+        path_params=[],
+        query_params=[],
+        header_params=[],
+        body_mode="none",
+        body_fields=[],
+        body_content_type=None,
+        handler=handler,
+    )
+
+
+# Hand-written because ocs_api_viewer cannot describe them: the OCS API reports
+# metadata about files but never serves their bytes, creates an ordinary folder
+# or deletes anything. Registering them in the catalogue rather than as their own
+# tools keeps the fixed surface small and delivers each operation's warnings
+# through `describe`, at the moment of use, instead of parking them in every
+# client's context for the whole session.
+BUILTIN_OPERATIONS: dict[str, OperationDefinition] = {
+    definition.name: definition
+    for definition in [
+        builtin_operation(
+            "webdav_read_file", "GET", "read_file",
+            "Read a file's contents",
+            "Read a file from the caller's Nextcloud files over WebDAV and return its contents "
+            "plus an ETag. Use this for anything the OCS API only describes rather than serves - "
+            "notably the body of a Collectives page, which the collectives operations report "
+            "metadata for but never return. Compose a page's path from its own index entry: "
+            "`{collectivePath}/{filePath}/{fileName}`, dropping `filePath` when it is empty. "
+            "Binary comes back base64-encoded in `data_base64`. A folder is refused rather than "
+            "returning the placeholder page Nextcloud serves for one.",
+            {"path": PATH_PROPERTY},
+            ["path"],
+        ),
+        builtin_operation(
+            "webdav_write_file", "PUT", "write_file",
+            "Replace a file's contents",
+            "Replace a file's contents over WebDAV. Pass `content` for text or `content_base64` "
+            "for binary - feeding a base64 read back through `content` would write the base64 "
+            "itself and corrupt the file. This overwrites the whole file, so read it first and "
+            "send the `etag` you got back as `if_match`: the write then fails with 412 instead of "
+            "discarding an edit somebody made in between. The parent folder must already exist - "
+            "a write below a missing one answers 404, not the 409 the WebDAV spec implies - so "
+            "create it with `webdav_create_folder`, or for a Collectives page use "
+            "`collectives_page_create` and write the body here.",
+            {
+                "path": PATH_PROPERTY,
+                "content": {"type": "string", "description": "The complete new contents, as text."},
+                "content_base64": {
+                    "type": "string",
+                    "description": "The complete new contents, base64-encoded, for binary files. "
+                                   "Mutually exclusive with `content`.",
+                },
+                "if_match": {
+                    "type": "string",
+                    "description": "ETag from a prior `webdav_read_file`. Omit only when "
+                                   "deliberately overwriting whatever is there.",
+                },
+            },
+            ["path"],
+        ),
+        builtin_operation(
+            "webdav_list_directory", "PROPFIND", "list_directory",
+            "List a folder's contents",
+            "List a folder's immediate children over WebDAV - name, path, whether it is a folder, "
+            "size, content type, last modified and ETag. Unlike `files_api_get_folder_tree`, which "
+            "reports folders only, this includes files. Paths come back ready to pass to the other "
+            "file operations.",
+            {
+                "path": {
+                    "type": "string",
+                    "description": "Folder to list. Omit or pass an empty string for the files root.",
+                }
+            },
+            [],
+        ),
+        builtin_operation(
+            "webdav_create_folder", "MKCOL", "create_folder",
+            "Create a folder",
+            "Create a folder over WebDAV. By default every missing folder on the way is created "
+            "too, which is what makes uploading a directory tree possible at all - MKCOL itself "
+            "makes exactly one level. A folder that already exists is reported as success, so this "
+            "is safe to call repeatedly while walking a tree.",
+            {
+                "path": PATH_PROPERTY,
+                "parents": {
+                    "type": "boolean",
+                    "description": "Create missing intermediate folders as well. Defaults to true; "
+                                   "set false to fail unless the parent already exists.",
+                },
+            },
+            ["path"],
+        ),
+        builtin_operation(
+            "webdav_delete", "DELETE", "delete_path",
+            "Delete a file or folder",
+            "Delete a file, or a folder and everything inside it, over WebDAV. Deleting a folder is "
+            "always recursive - WebDAV has no shallow variant - so a folder is refused unless "
+            "`recursive` is true. Deleted items go to the Nextcloud trash bin, not straight to "
+            "oblivion.",
+            {
+                "path": PATH_PROPERTY,
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Required to be true when the path is a folder, confirming that "
+                                   "everything inside it should go too.",
+                },
+            },
+            ["path"],
+        ),
+    ]
+}
 
 
 def tool_result(payload: dict[str, Any], is_error: bool = False) -> types.CallToolResult:
@@ -1139,12 +1520,12 @@ def describe_result(arguments: dict[str, Any], auth_context: AuthContext) -> typ
     if isinstance(names, str):
         names = [names]
 
-    state = current_state()
+    operations = all_operations()
     described: list[dict[str, Any]] = []
     unknown: list[dict[str, Any]] = []
 
     for name in names:
-        definition = state.operations.get(name)
+        definition = operations.get(name)
         if definition is None:
             unknown.append({"name": name, "did_you_mean": suggest_operation_names(name)})
             continue
@@ -1174,7 +1555,7 @@ async def call_result(
         return missing_credentials_result(CALL_TOOL_NAME)
 
     operation_name = arguments.get("name")
-    definition = current_state().operations.get(operation_name)
+    definition = all_operations().get(operation_name)
     if definition is None:
         return tool_result(
             {
@@ -1185,36 +1566,22 @@ async def call_result(
             is_error=True,
         )
 
+    operation_arguments = arguments.get("arguments") or {}
     try:
-        payload = await execute_operation(definition, arguments.get("arguments") or {}, auth_context)
+        if definition.handler:
+            # `arguments` is passed through unvalidated, so trim it to the schema
+            # rather than letting a stray key become an unexpected keyword.
+            accepted = set(definition.input_schema.get("properties", {}))
+            payload = await WEBDAV_HANDLERS[definition.handler](
+                auth_context,
+                **{key: value for key, value in operation_arguments.items() if key in accepted},
+            )
+        else:
+            payload = await execute_operation(definition, operation_arguments, auth_context)
     except ValueError as exc:
         return tool_result({"ok": False, "error": str(exc), "tool_name": definition.name}, is_error=True)
-    return tool_result(payload)
-
-
-async def file_result(
-    tool_name: str,
-    arguments: dict[str, Any],
-    auth_context: AuthContext,
-) -> types.CallToolResult:
-    if not auth_context.auth_header:
-        return missing_credentials_result(tool_name)
-
-    try:
-        if tool_name == READ_FILE_TOOL_NAME:
-            payload = await read_file(auth_context, arguments.get("path"))
-        else:
-            payload = await write_file(
-                auth_context,
-                arguments.get("path"),
-                arguments.get("content", ""),
-                arguments.get("if_match"),
-            )
-    except ValueError as exc:
-        return tool_result({"ok": False, "error": str(exc), "tool_name": tool_name}, is_error=True)
-
-    payload["tool_name"] = tool_name
-    return tool_result(payload, is_error=not payload["ok"])
+    payload.setdefault("operation", definition.name)
+    return tool_result(payload, is_error=not payload.get("ok", True))
 
 
 async def on_call_tool(
@@ -1242,8 +1609,6 @@ async def on_call_tool(
         return describe_result(arguments, auth_context)
     if params.name == CALL_TOOL_NAME:
         return await call_result(arguments, auth_context)
-    if params.name in (READ_FILE_TOOL_NAME, WRITE_FILE_TOOL_NAME):
-        return await file_result(params.name, arguments, auth_context)
 
     raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {params.name}")
 

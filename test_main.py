@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import time
 
@@ -20,8 +21,6 @@ META_TOOL_NAMES = [
     main.FIND_TOOL_NAME,
     main.DESCRIBE_TOOL_NAME,
     main.CALL_TOOL_NAME,
-    main.READ_FILE_TOOL_NAME,
-    main.WRITE_FILE_TOOL_NAME,
 ]
 
 AUTH_HEADERS = {
@@ -604,7 +603,9 @@ def test_describe_suggests_alternatives_for_an_unknown_name():
     )["result"]["structuredContent"]
 
     assert result["ok"] is False
-    assert result["unknown"][0]["did_you_mean"] == ["collectives_page_create"]
+    # The built-in webdav entries are always in the catalogue, so they can be
+    # suggested too; what matters is that the intended operation ranks first.
+    assert result["unknown"][0]["did_you_mean"][0] == "collectives_page_create"
 
 
 def test_call_rejects_an_unknown_operation_without_reaching_nextcloud():
@@ -832,8 +833,12 @@ class FakeResponse:
 
 
 class FakeClient:
-    def __init__(self, response, record):
-        self._response, self._record = response, record
+    """Records every call. `responses` may be one response or a queue of them,
+    because create_folder walks a chain and delete probes before acting."""
+
+    def __init__(self, responses, calls):
+        self._responses = list(responses) if isinstance(responses, list) else [responses]
+        self._calls = calls
 
     async def __aenter__(self):
         return self
@@ -841,25 +846,58 @@ class FakeClient:
     async def __aexit__(self, *_):
         return False
 
+    def _next(self, entry):
+        self._calls.append(entry)
+        return self._responses[min(len(self._calls) - 1, len(self._responses) - 1)]
+
     async def get(self, url, headers=None):
-        self._record.update(method="GET", url=url, headers=headers)
-        return self._response
+        return self._next({"method": "GET", "url": url, "headers": headers})
 
     async def put(self, url, headers=None, content=None):
-        self._record.update(method="PUT", url=url, headers=headers, content=content)
-        return self._response
+        return self._next({"method": "PUT", "url": url, "headers": headers, "content": content})
+
+    async def request(self, method, url, headers=None, content=None):
+        return self._next({"method": method, "url": url, "headers": headers, "content": content})
 
 
-def run_webdav(coro_factory, response):
+def run_webdav(coro_factory, responses):
     """Swap httpx2.AsyncClient for a recorder so the WebDAV request that would
-    have gone out can be asserted on."""
-    record = {}
+    have gone out can be asserted on. Returns (result, first call) for the common
+    single-request case; `calls` on the record holds the full sequence."""
+    calls = []
     original = main.httpx2.AsyncClient
-    main.httpx2.AsyncClient = lambda **_: FakeClient(response, record)
+    main.httpx2.AsyncClient = lambda **_: FakeClient(responses, calls)
     try:
-        return asyncio.run(coro_factory()), record
+        result = asyncio.run(coro_factory())
     finally:
         main.httpx2.AsyncClient = original
+    record = dict(calls[0]) if calls else {}
+    record["calls"] = calls
+    return result, record
+
+
+MULTISTATUS = """<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:">
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/kb/</d:href>
+    <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/kb/%E7%AC%AC%E4%B8%80%E7%AB%A0%20%E6%A6%82%E8%AB%96/</d:href>
+    <d:propstat><d:prop><d:resourcetype><d:collection/></d:resourcetype></d:prop>
+    <d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/files/alice/kb/notes.md</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype/>
+      <d:getcontentlength>143</d:getcontentlength>
+      <d:getcontenttype>text/markdown</d:getcontenttype>
+      <d:getetag>"abc-gzip"</d:getetag>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"""
 
 
 def test_header_auth_context_keeps_the_username_for_webdav():
@@ -926,6 +964,47 @@ def test_read_file_base64_encodes_binary():
     assert "data" not in payload
 
 
+def test_etag_from_a_compressed_read_is_usable_as_if_match():
+    """Observed against a live instance: a GET that the server gzips comes back
+    with `"<hash>-gzip"`, but the entity's validator is `"<hash>"`. Returning the
+    mangled value made every guarded write fail with 412 while nothing had
+    changed, and re-reading returned the same mangled value - an unbreakable
+    loop, with an error message that blamed a concurrent edit."""
+    write_etag = '"98b5f8bc2afdd50bf5b24f4a39d4c2d1"'
+    read_response = FakeResponse(
+        headers={"content-type": "text/markdown", "etag": '"98b5f8bc2afdd50bf5b24f4a39d4c2d1-gzip"'},
+        body=b"x",
+    )
+
+    payload, _ = run_webdav(lambda: main.read_file(webdav_auth(), "kb/page.md"), read_response)
+
+    assert payload["etag"] == write_etag
+
+
+def test_etag_normalisation_covers_the_other_encodings_and_weak_validators():
+    # -zstd was also observed live; W/ is the standard weak-validator prefix.
+    assert main.normalize_etag('"abc-zstd"') == '"abc"'
+    assert main.normalize_etag('"abc-br"') == '"abc"'
+    assert main.normalize_etag('"abc-deflate"') == '"abc"'
+    assert main.normalize_etag('W/"abc-gzip"') == 'W/"abc"'
+    # Untouched: no suffix, and a hash that merely ends in something similar.
+    assert main.normalize_etag('"abc"') == '"abc"'
+    assert main.normalize_etag(None) is None
+
+
+def test_a_stale_if_match_from_before_the_fix_is_normalised_too():
+    """Callers may still be holding a mangled ETag from an earlier read, so the
+    inbound value is normalised as well rather than only the outbound one."""
+    response = FakeResponse(status_code=204, headers={"etag": '"new"'})
+
+    _, record = run_webdav(
+        lambda: main.write_file(webdav_auth(), "kb/page.md", "x", if_match='"abc-gzip"'),
+        response,
+    )
+
+    assert record["headers"]["If-Match"] == '"abc"'
+
+
 def test_write_file_sends_utf8_bytes_and_if_match():
     response = FakeResponse(status_code=204, headers={"etag": '"new"'})
 
@@ -961,19 +1040,254 @@ def test_write_file_explains_a_precondition_failure():
     assert "Read it again" in payload["error"]
 
 
-def test_file_tools_require_caller_credentials():
-    for tool in (main.READ_FILE_TOOL_NAME, main.WRITE_FILE_TOOL_NAME):
-        result = run_mcp(
-            lambda client, tool=tool: post_mcp(
-                client,
-                "tools/call",
-                {"name": tool, "arguments": {"path": "kb/page.md", "content": "x"}},
-                call_headers(tool, authenticated=False),
-            )
-        )["result"]["structuredContent"]
+# --- gaps found by testing against a real instance ---------------------------
+#
+# Everything below was written after live testing contradicted an assumption the
+# code or the docs had made.
 
-        assert result["ok"] is False, tool
-        assert "Missing request credentials" in result["error"], tool
+
+def test_a_missing_parent_reports_404_not_the_409_the_spec_suggests():
+    """Nextcloud answers a write below a missing folder with 404. The code only
+    mapped 409, so the guidance never fired and callers got raw SabreDAV XML."""
+    response = FakeResponse(status_code=404, body=b"<d:error>not found</d:error>")
+
+    payload, _ = run_webdav(
+        lambda: main.write_file(webdav_auth(), "nope/deeper/page.md", "x"), response
+    )
+
+    assert payload["ok"] is False
+    assert "webdav_create_folder" in payload["error"]
+
+
+def test_reading_a_folder_is_an_error_not_a_false_success():
+    """Live, `read_file("Documents")` returned 200 and the HTML blurb Nextcloud
+    serves for a collection, so a mistyped path looked like a file whose contents
+    were 'This is the WebDAV interface...'."""
+    response = FakeResponse(
+        status_code=200,
+        headers={"content-type": "text/html; charset=UTF-8"},
+        body=b"This is the WebDAV interface. It can only be accessed by WebDAV clients",
+    )
+
+    payload, _ = run_webdav(lambda: main.read_file(webdav_auth(), "Documents"), response)
+
+    assert payload["ok"] is False
+    assert "webdav_list_directory" in payload["error"]
+    assert "data" not in payload
+
+
+def test_a_real_file_is_not_mistaken_for_a_folder():
+    """The collection check keys on a missing ETag, so an ordinary HTML file -
+    which does have one - must still read normally."""
+    response = FakeResponse(
+        status_code=200,
+        headers={"content-type": "text/html", "etag": '"abc"'},
+        body=b"<h1>a real page</h1>",
+    )
+
+    payload, _ = run_webdav(lambda: main.read_file(webdav_auth(), "page.html"), response)
+
+    assert payload["ok"] is True
+    assert payload["data"] == "<h1>a real page</h1>"
+
+
+def test_binary_round_trip_uses_content_base64():
+    """Reads hand binary back base64-encoded. With only a text field, feeding
+    that back wrote the base64 itself and the next read encoded it again -
+    silent corruption that reported success at every step."""
+    original = b"\x89PNG\r\n\x1a\n\x00\xff"
+    response = FakeResponse(status_code=204, headers={"etag": '"new"'})
+
+    payload, record = run_webdav(
+        lambda: main.write_file(
+            webdav_auth(), "photo.png", content_base64=base64.b64encode(original).decode()
+        ),
+        response,
+    )
+
+    assert record["content"] == original
+    assert payload["bytes_written"] == len(original)
+
+
+def test_content_and_content_base64_are_mutually_exclusive():
+    try:
+        main.write_payload_bytes("text", base64.b64encode(b"bytes").decode())
+    except ValueError as exc:
+        assert "not both" in str(exc)
+    else:
+        raise AssertionError("passing both was not rejected")
+
+
+def test_invalid_base64_is_rejected_before_the_request():
+    try:
+        main.write_payload_bytes(None, "not valid base64!!")
+    except ValueError as exc:
+        assert "base64" in str(exc)
+    else:
+        raise AssertionError("invalid base64 was not rejected")
+
+
+def test_propfind_entries_come_back_as_reusable_relative_paths():
+    """A listing is only useful if its paths can be handed straight to the other
+    file tools, so the DAV prefix and percent-encoding have to come off."""
+    entries = main.parse_propfind(MULTISTATUS, webdav_auth())
+
+    assert [e["path"] for e in entries] == ["kb", "kb/第一章 概論", "kb/notes.md"]
+    assert entries[1]["is_folder"] is True
+    assert entries[2]["is_folder"] is False
+    assert entries[2]["size"] == 143
+    # Listings carry ETags too, and they get mangled by compression just the same.
+    assert entries[2]["etag"] == '"abc"'
+
+
+def test_list_directory_drops_the_folder_itself():
+    """PROPFIND Depth 1 returns the folder first; the caller asked what is inside."""
+    response = FakeResponse(status_code=207, body=MULTISTATUS.encode("utf-8"))
+
+    payload, record = run_webdav(lambda: main.list_directory(webdav_auth(), "kb"), response)
+
+    assert record["method"] == "PROPFIND"
+    assert record["headers"]["Depth"] == "1"
+    assert [e["name"] for e in payload["entries"]] == ["第一章 概論", "notes.md"]
+
+
+def test_list_directory_accepts_the_files_root():
+    """Every other path is required; the root is the one legitimate empty path."""
+    response = FakeResponse(status_code=207, body=MULTISTATUS.encode("utf-8"))
+
+    _, record = run_webdav(lambda: main.list_directory(webdav_auth(), ""), response)
+
+    assert record["url"].endswith("/remote.php/dav/files/alice")
+
+
+def test_create_folder_walks_the_whole_chain():
+    """MKCOL makes exactly one level, so uploading a tree is impossible unless
+    the missing intermediates are created first."""
+    response = FakeResponse(status_code=201)
+
+    payload, record = run_webdav(
+        lambda: main.create_folder(webdav_auth(), "a/b/c"), response
+    )
+
+    assert [c["method"] for c in record["calls"]] == ["MKCOL", "MKCOL", "MKCOL"]
+    assert payload["created"] == ["a", "a/b", "a/b/c"]
+
+
+def test_create_folder_treats_an_existing_folder_as_success():
+    """405 means it is already there. A caller looping over a tree should not
+    have to tell 'made it' apart from 'already present'."""
+    response = FakeResponse(status_code=405)
+
+    payload, _ = run_webdav(lambda: main.create_folder(webdav_auth(), "a/b"), response)
+
+    assert payload["ok"] is True
+    assert payload["created"] == []
+    assert payload["already_existed"] == ["a", "a/b"]
+
+
+def test_create_folder_without_parents_only_makes_the_leaf():
+    response = FakeResponse(status_code=201)
+
+    payload, record = run_webdav(
+        lambda: main.create_folder(webdav_auth(), "a/b/c", parents=False), response
+    )
+
+    assert len(record["calls"]) == 1
+    assert payload["created"] == ["a/b/c"]
+
+
+def test_delete_refuses_a_folder_unless_recursive_is_explicit():
+    """WebDAV DELETE on a collection always takes everything inside, and offers
+    no shallow variant, so a mistyped path could remove a subtree."""
+    probe = FakeResponse(status_code=207, body=MULTISTATUS.encode("utf-8"))
+
+    payload, record = run_webdav(lambda: main.delete_path(webdav_auth(), "kb"), probe)
+
+    assert payload["ok"] is False
+    assert payload["is_folder"] is True
+    assert [c["method"] for c in record["calls"]] == ["PROPFIND"]  # never reached DELETE
+
+
+def test_delete_removes_a_folder_when_recursive_is_given():
+    probe = FakeResponse(status_code=207, body=MULTISTATUS.encode("utf-8"))
+    deleted = FakeResponse(status_code=204)
+
+    payload, record = run_webdav(
+        lambda: main.delete_path(webdav_auth(), "kb", recursive=True), [probe, deleted]
+    )
+
+    assert payload["ok"] is True
+    assert [c["method"] for c in record["calls"]] == ["PROPFIND", "DELETE"]
+
+
+def test_delete_removes_a_file_without_needing_recursive():
+    file_probe = FakeResponse(
+        status_code=207,
+        body="""<?xml version="1.0"?>
+        <d:multistatus xmlns:d="DAV:"><d:response>
+          <d:href>/remote.php/dav/files/alice/notes.md</d:href>
+          <d:propstat><d:prop><d:resourcetype/></d:prop></d:propstat>
+        </d:response></d:multistatus>""".encode("utf-8"),
+    )
+    deleted = FakeResponse(status_code=204)
+
+    payload, _ = run_webdav(
+        lambda: main.delete_path(webdav_auth(), "notes.md"), [file_probe, deleted]
+    )
+
+    assert payload["ok"] is True
+    assert payload["is_folder"] is False
+
+
+def test_webdav_operations_are_in_the_catalogue_not_the_tool_list():
+    """They are published through find/describe/call like everything else, so the
+    fixed surface stays small and each operation's warnings arrive from describe
+    at the moment of use rather than sitting in context all session."""
+    listed = run_mcp(lambda client: post_mcp(client, "tools/list"))["result"]
+    assert [t["name"] for t in listed["tools"]] == META_TOOL_NAMES
+
+    found = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.FIND_TOOL_NAME, "arguments": {"app": main.WEBDAV_APP_ID}},
+            call_headers(main.FIND_TOOL_NAME),
+        )
+    )["result"]["structuredContent"]
+
+    assert sorted(row["name"] for row in found["operations"]) == [
+        "webdav_create_folder", "webdav_delete", "webdav_list_directory",
+        "webdav_read_file", "webdav_write_file",
+    ]
+
+
+def test_a_webdav_operation_still_refuses_an_uncredentialed_caller():
+    """Routing them through call_operation must not lose the credential gate."""
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {
+                "name": main.CALL_TOOL_NAME,
+                "arguments": {"name": "webdav_read_file", "arguments": {"path": "kb/page.md"}},
+            },
+            call_headers(main.CALL_TOOL_NAME, authenticated=False),
+        )
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert "Missing request credentials" in result["error"]
+
+
+def test_the_find_description_advertises_the_builtin_webdav_app():
+    """Nothing discovers these, so without the index entry a client would have no
+    way to learn they exist."""
+    listed = run_mcp(
+        lambda client: post_mcp(client, "tools/list", headers=AUTH_HEADERS)
+    )["result"]
+    find = next(t for t in listed["tools"] if t["name"] == main.FIND_TOOL_NAME)
+
+    assert f"{main.WEBDAV_APP_ID}:{len(main.BUILTIN_OPERATIONS)}" in find["description"]
 
 
 def test_healthcheck_does_not_leak_the_nextcloud_url():

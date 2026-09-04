@@ -4,7 +4,7 @@ Exposes a live Nextcloud instance as an MCP server, reflecting whatever apps tha
 
 Instead of shipping a fixed tool list, this server queries the Nextcloud `ocs_api_viewer` app at startup, reads the OpenAPI description of each installed app, and turns those operations into a searchable catalogue. Point it at a Nextcloud with 28 apps enabled and all ~545 operations those apps expose become callable - no per-app integration code.
 
-The catalogue is published as a handful of fixed tools rather than one tool per operation, so a client spends about 1,200 tokens of context on this server instead of ~101,000.
+The catalogue is published as a handful of fixed tools rather than one tool per operation, so a client spends about 760 tokens of context on this server instead of ~101,000.
 
 Speaks MCP protocol revision `2026-07-28` (the stateless core) and still answers the older handshake revisions for clients that have not migrated.
 
@@ -39,39 +39,48 @@ dav_upcoming_events_get_events
 
 ## Tools
 
-The server publishes six tools, whatever the connected instance has installed:
+The server publishes four tools, whatever the connected instance has installed:
 
 - **`nextcloud_find_operations`** - search the catalogue by free text and/or app id. Returns each match's name, HTTP method, path and summary. For a credentialed caller its own description also carries the app index (`collectives:84, spreed:142, ...`), so a client knows what exists before searching.
 - **`nextcloud_describe_operations`** - the full JSON Schema for one or more operations, so their arguments can be filled in. Takes a list, so a whole task's operations can be fetched in one call.
 - **`nextcloud_call_operation`** - execute one operation by name with an `arguments` object.
 - **`nextcloud_discovery_status`** - auth mode, operation count, and last refresh state. A credentialed caller also gets the connected instance URL, the discovered-app inventory and the raw discovery error. Pass `{"refresh": true}` (credentials required) to re-run discovery first.
-- **`nextcloud_read_file`** - read a file from the caller's files over WebDAV, returning its contents and an ETag. Binary comes back base64-encoded.
-- **`nextcloud_write_file`** - replace a file's contents with UTF-8 text, optionally guarded by `if_match`.
-
 Every tool except `nextcloud_discovery_status` requires the caller's credentials; see [Authentication](#authentication).
 
 A typical first use is `find` → `describe` → `call`. An unknown or near-miss operation name comes back with a `did_you_mean` list rather than an error, so a wrong guess costs one round trip instead of a failed task.
 
 ### WebDAV
 
-The two file tools are the one hand-written part of the surface. Everything else on this server is reflected from `ocs_api_viewer`, and that describes the **OCS API only** - which serves metadata about files but never their bytes. `collectives_page_get` reports that a page is 2,739 bytes and what it is called; nothing in the catalogue returns the 2,739 bytes. `files` exposes sixteen OCS operations and not one of them downloads a file. Page bodies live at `/remote.php/dav/files/<user>/…`, outside anything discovery can see.
+Five `webdav_*` operations are the one hand-written part of the catalogue. Everything else on this server is reflected from `ocs_api_viewer`, and that describes the **OCS API only** - which serves metadata about files but never their bytes. `collectives_page_get` reports that a page is 2,739 bytes and what it is called; nothing in the catalogue returns the 2,739 bytes. `files` exposes sixteen OCS operations and not one of them downloads a file, creates an ordinary folder, or deletes anything; `files_api_get_folder_tree` lists folders but omits the files inside them. Page bodies live at `/remote.php/dav/files/<user>/…`, outside anything discovery can see.
 
-Rather than teach the server about Collectives, the gap is closed with a generic file read and write. A page body is just a file, so the app-agnostic primitive covers it and everything else, and the server keeps its property of having no per-app integration code. Composing a page's path is the caller's job, from fields its own index entry already returns:
+They are registered as catalogue entries rather than as tools of their own, so `nextcloud_find_operations` finds them beside the discovered ones, `nextcloud_describe_operations` returns their schemas, and `nextcloud_call_operation` runs them. The fixed surface stays at four tools, and each operation's warnings arrive from `describe` at the moment of use instead of sitting in every client's context for the whole session. Because nothing discovers them, `find`'s own description lists `webdav` in its app index; searching `delete folder` also ranks `webdav_delete` first without knowing the app name.
+
+Rather than teach the server about Collectives, the gap is closed with generic file operations. A page body is just a file, so the app-agnostic primitive covers it and everything else, and the server keeps its property of having no per-app integration code. Composing a page's path is the caller's job, from fields its own index entry already returns:
 
 ```text
 {collectivePath}/{filePath}/{fileName}      # filePath is often empty
 .Collectives/研究筆記/第一章 概論/背景.md
 ```
 
-Both tools use the caller's own credentials, so they reach exactly the files that caller can reach. Paths are confined to that user's files root: `.` and `..` segments are rejected rather than normalised, because Basic auth stops a caller reaching another user's files but would not stop a traversal climbing out of `files/<user>/` into the other DAV endpoints.
+All five run under the caller's own credentials - `nextcloud_call_operation` refuses an uncredentialed caller whichever operation it names - so they reach exactly the files that caller can reach. Paths are confined to that user's files root: `.` and `..` segments are rejected rather than normalised, because Basic auth stops a caller reaching another user's files but would not stop a traversal climbing out of `files/<user>/` into the other DAV endpoints.
 
-`nextcloud_write_file` replaces the whole file. Read first, send the `etag` back as `if_match`, and a write computed from stale content fails with 412 instead of silently discarding whatever changed in between. It will not create parent folders - make a page with `collectives_page_create` first, then write its body.
+`webdav_write_file` replaces the whole file. Read first, send the `etag` back as `if_match`, and a write computed from stale content fails with 412 instead of silently discarding whatever changed in between. It will not create parent folders on its own - use `webdav_create_folder`, or for a Collectives page create it with `collectives_page_create` and write the body afterwards.
+
+Binary goes through `content_base64`, because reads hand binary back base64-encoded and feeding that into the text field would write the base64 itself, then encode it again on the next read - a silent round-trip corruption that reports success at every step.
+
+`webdav_delete` refuses a folder unless `recursive` is set: WebDAV DELETE on a collection always takes everything inside and has no shallow variant, so the resource is inspected first rather than letting a mistyped path remove a subtree. Deletions land in the Nextcloud trash bin.
+
+Three behaviours here were corrected only after testing against a real instance rather than reasoning from the specification:
+
+- A write below a missing folder answers **404**, not the 409 the WebDAV spec implies, so guidance keyed on 409 never appeared.
+- `GET` on a folder returns **200** with the HTML placeholder Nextcloud serves for a collection, which made a mistyped path look like a successfully read file. Files always carry an ETag and that page never does, which is how the two are told apart.
+- ETags come back with a `-gzip` (or `-br`, `-deflate`, `-zstd`) suffix whenever the response is compressed, while the entity's real validator has none. Handing the suffixed value back as `If-Match` failed with 412 while nothing had changed, and re-reading returned the same suffixed value - an unbreakable loop. It only bites on responses large enough to compress, so small test files never showed it.
 
 ### Why Not One Tool Per Operation
 
 An instance with every app enabled discovers ~545 operations. Publishing those as ~545 MCP tools puts their full input schemas into the context of every client on every session - measured against a live instance, 403,875 characters, roughly **101,000 tokens**, before a single call is made. No session uses more than a handful of them.
 
-The fixed surface costs **~1,200 tokens**, a 98.8% reduction, and a realistic `find` + `describe` round trip adds ~310 tokens. Ten operations looked up on demand still cost an order of magnitude less than the old tool list.
+The fixed surface costs **~760 tokens**, a 99.2% reduction, and a realistic `find` + `describe` round trip adds ~310 tokens. Ten operations looked up on demand still cost an order of magnitude less than the old tool list.
 
 The trade is one extra round trip before an unfamiliar operation, and no client-side schema validation on `nextcloud_call_operation` - the `arguments` object is passed through as given, so `describe` is what keeps a call well-formed.
 
@@ -248,7 +257,7 @@ Older handshake-protocol clients still work; the transport routes by the `MCP-Pr
 
 Upstream registers one MCP tool per discovered operation. On a fully-loaded instance that is ~545 tools and ~101,000 tokens of `inputSchema` in every client's context, permanently, for a handful of actual calls. Roughly a third of it was not even schema: `dynamic_tool_description` prefixed every tool with the same two fixed sentences, ~98,000 characters of identical text across the list.
 
-This fork publishes a fixed handful instead - `find` / `describe` / `call` plus the status tool, and the two WebDAV file tools - and searches the catalogue on demand. Measured against the same instance: ~1,200 tokens, 98.8% less. See [Why Not One Tool Per Operation](#why-not-one-tool-per-operation).
+This fork publishes four instead - `find` / `describe` / `call` plus the status tool - and searches the catalogue on demand. Measured against the same instance: ~760 tokens, 99.2% less. See [Why Not One Tool Per Operation](#why-not-one-tool-per-operation).
 
 **Breaking:** operation names are unchanged, but they are no longer MCP tool names. A client that called `collectives_page_create` directly now calls `nextcloud_call_operation` with `{"name": "collectives_page_create", "arguments": {...}}`, and per-tool permission allowlists need rewriting against the fixed tool names.
 
@@ -256,7 +265,7 @@ This fork publishes a fixed handful instead - `find` / `describe` / `call` plus 
 
 `ocs_api_viewer` describes the OCS API, and the OCS API serves metadata about files but never their bytes. Upstream therefore cannot read or write a file at all: `collectives_page_get` reports a page's size and filename, `files` exposes sixteen operations, and none of them returns content. For a Collectives instance that means the whole point of the knowledge base - the pages - is unreachable.
 
-Added `nextcloud_read_file` and `nextcloud_write_file`, speaking WebDAV with the caller's own credentials. They are generic file access rather than Collectives-aware, so the server keeps its defining property of having no per-app integration code. See [WebDAV](#webdav).
+Added five WebDAV operations - read, write, list, create folder, delete - speaking with the caller's own credentials. They are generic file access rather than Collectives-aware, so the server keeps its defining property of having no per-app integration code. Several of their behaviours were corrected only after testing against a real instance; see [WebDAV](#webdav).
 
 ### Security fixes
 
@@ -278,6 +287,6 @@ Added `nextcloud_read_file` and `nextcloud_write_file`, speaking WebDAV with the
 
 ### Added
 
-- `test_main.py` - 48 tests
+- `test_main.py` - 68 tests
 - `.gitignore`, `requirements-dev.txt`
 - `DEVLOG.md` - change log and open items
