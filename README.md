@@ -41,10 +41,12 @@ dav_upcoming_events_get_events
 
 The server publishes four tools, whatever the connected instance has installed:
 
-- **`nextcloud_find_operations`** - search the catalogue by free text and/or app id. Returns each match's name, HTTP method, path and summary. Its own description carries the app index (`collectives:84, spreed:142, ...`) so a client knows what exists before searching.
+- **`nextcloud_find_operations`** - search the catalogue by free text and/or app id. Returns each match's name, HTTP method, path and summary. For a credentialed caller its own description also carries the app index (`collectives:84, spreed:142, ...`), so a client knows what exists before searching.
 - **`nextcloud_describe_operations`** - the full JSON Schema for one or more operations, so their arguments can be filled in. Takes a list, so a whole task's operations can be fetched in one call.
 - **`nextcloud_call_operation`** - execute one operation by name with an `arguments` object.
-- **`nextcloud_discovery_status`** - connected instance, auth mode, discovered apps, operation count, and last refresh/error state. Pass `{"refresh": true}` to re-run discovery first.
+- **`nextcloud_discovery_status`** - auth mode, operation count, and last refresh state. A credentialed caller also gets the connected instance URL, the discovered-app inventory and the raw discovery error. Pass `{"refresh": true}` (credentials required) to re-run discovery first.
+
+`find`, `describe` and `call` all require the caller's credentials; see [Authentication](#authentication).
 
 A typical first use is `find` → `describe` → `call`. An unknown or near-miss operation name comes back with a `did_you_mean` list rather than an error, so a wrong guess costs one round trip instead of a failed task.
 
@@ -74,7 +76,7 @@ The server comes up at `http://localhost:8000/` (health) and `http://localhost:8
 
 Health endpoint. Returns the server name and version, the MCP path, whether discovery credentials are configured, whether the last discovery succeeded, and the app/tool counts.
 
-It deliberately does **not** return the Nextcloud URL, the installed-app inventory, or discovery error text. This endpoint is reachable cross-origin and those fields describe an internal instance; call the `nextcloud_discovery_status` tool for the full picture.
+It deliberately does **not** return the Nextcloud URL, the installed-app inventory, or discovery error text. This endpoint is reachable cross-origin and those fields describe an internal instance; call the `nextcloud_discovery_status` tool **with credentials** for the full picture.
 
 ```bash
 curl http://localhost:8000/
@@ -120,6 +122,10 @@ Two credential paths, deliberately separated:
 | Execution (stdio) | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Every proxied tool call |
 
 Over HTTP the server **never** falls back to the discovery account for execution. A tool call without credential headers is rejected, so one shared server URL can never let one caller act as another. This is what makes a single deployment safe for a team: everyone points at the same URL and authenticates as themselves.
+
+Discovery is gated to the same degree. The catalogue names every app the instance has installed and every API path it exposes, so `nextcloud_find_operations` and `nextcloud_describe_operations` reject an uncredentialed caller exactly as `nextcloud_call_operation` does, and `nextcloud_discovery_status` withholds the instance URL and app inventory. `tools/list` itself stays open, because a client that cannot list tools cannot connect at all - what it returns to an anonymous caller is four tool names and no instance detail.
+
+Because MCP clients configure these as transport headers, they are sent on every request including `tools/list`; a client that cannot send them could not execute anything anyway.
 
 Over `stdio` there are no HTTP headers and the process serves exactly one local client, so the configured account *is* that caller's account.
 
@@ -235,6 +241,7 @@ This fork publishes four tools instead - `find` / `describe` / `call` plus the s
 - **Auth header override.** An OpenAPI header parameter named `Authorization` became a tool argument that overwrote the caller's credentials. Now filtered alongside `OCS-APIRequest`.
 - **Open CORS.** `allow_origins` was pinned to `["*"]`. Now driven by `CORS_ALLOW_ORIGINS`, closed by default.
 - **Health endpoint disclosure.** `GET /` returned the internal Nextcloud URL, the API-viewer URL, the installed-app inventory, and raw discovery error text to any origin. Trimmed to non-sensitive fields.
+- **Unauthenticated discovery.** Execution was credentialed from the start, but nothing else was. `nextcloud_discovery_status` was dispatched before any credential check, so an anonymous caller got the internal Nextcloud URL and the full app inventory - the very fields `GET /` had just been trimmed of, which made that trimming pointless. Searching the catalogue was open too, `{"refresh": true}` let anyone turn one request into a full re-discovery against Nextcloud using the server's own credentials, and because the unknown-operation branch ran before the credential check its `did_you_mean` list could be used to enumerate operations one guess at a time. All four are now behind the caller's credentials.
 
 ### Compatibility fixes
 
@@ -248,6 +255,6 @@ This fork publishes four tools instead - `find` / `describe` / `call` plus the s
 
 ### Added
 
-- `test_main.py` - 31 tests
+- `test_main.py` - 38 tests
 - `.gitignore`, `requirements-dev.txt`
 - `DEVLOG.md` - change log and open items

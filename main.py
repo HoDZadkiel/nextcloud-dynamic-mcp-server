@@ -550,11 +550,18 @@ async def refresh_state(force: bool = False) -> DiscoveryState:
 
 
 def discovery_status_payload(request_context: AuthContext) -> dict[str, Any]:
+    """Report status, disclosing the instance itself only to a credentialed caller.
+
+    `GET /` is deliberately trimmed of the Nextcloud URL, the app inventory and
+    raw discovery error text because it is reachable cross-origin. That trimming
+    is worthless while this tool hands the same fields to anyone who can reach
+    `/mcp`, so the same split is enforced here. What stays open is the caller's
+    own auth diagnostics - exactly what someone whose credentials are not
+    working needs in order to fix them.
+    """
     discovery_auth_context = default_auth_context()
     state = current_state()
-    return {
-        "nextcloud_url": NEXTCLOUD_URL,
-        "api_viewer_url": API_VIEWER_URL,
+    payload: dict[str, Any] = {
         "discovery_auth_source": discovery_auth_context.source,
         "discovery_auth_configured": discovery_auth_context.auth_header is not None,
         "request_auth_source": request_context.source,
@@ -565,11 +572,21 @@ def discovery_status_payload(request_context: AuthContext) -> dict[str, Any]:
         ],
         "app_count": len(state.apps),
         "tool_count": len(state.operations),
-        "apps": state.apps,
         "last_refresh": state.last_refresh,
-        "last_error": state.last_error,
+        "discovery_ok": state.last_refresh is not None and state.last_error is None,
         "discovery_retry_seconds": DISCOVERY_RETRY_SECONDS,
     }
+
+    if request_context.auth_header:
+        payload.update(
+            {
+                "nextcloud_url": NEXTCLOUD_URL,
+                "api_viewer_url": API_VIEWER_URL,
+                "apps": state.apps,
+                "last_error": state.last_error,
+            }
+        )
+    return payload
 
 
 def operation_row(definition: OperationDefinition) -> dict[str, Any]:
@@ -648,7 +665,34 @@ def app_index() -> str:
     return ", ".join(f"{app['id']}:{app['operation_count']}" for app in apps)
 
 
-def list_tools() -> list[types.Tool]:
+def find_tool_description(authenticated: bool) -> str:
+    """The catalogue overview is instance-specific, so only credentialed
+    callers get it. `tools/list` itself stays open - a client that cannot list
+    tools cannot connect at all - but what an anonymous caller learns is then
+    limited to the four tool names, which the public repository already
+    documents."""
+    shared = (
+        f"Start here, then call `{DESCRIBE_TOOL_NAME}` for the arguments of the "
+        f"operations you picked, then `{CALL_TOOL_NAME}` to run one. "
+        f"Use this only for real operations against the configured Nextcloud server, "
+        f"not for documentation lookup or local workspace tasks."
+    )
+    if not authenticated:
+        return (
+            "Search the live Nextcloud API operations available on the connected "
+            "instance and return their names, HTTP method, path and summary. "
+            f"{shared} Requires the `X-Nextcloud-Username` and `X-Nextcloud-AppToken` "
+            "request headers."
+        )
+    return (
+        f"Search the {len(current_state().operations)} live Nextcloud API operations "
+        f"available on the connected instance and return their names, HTTP method, "
+        f"path and summary. {shared} "
+        f"Apps on this instance (id:operations) - {app_index()}."
+    )
+
+
+def list_tools(authenticated: bool = False) -> list[types.Tool]:
     """Publish a fixed four-tool surface instead of one tool per operation.
 
     An instance with every app enabled discovers ~550 operations. Publishing
@@ -657,8 +701,6 @@ def list_tools() -> list[types.Tool]:
     handful of them. The catalogue is searched on demand instead, which costs
     one extra round trip and about 1k tokens of context.
     """
-    operation_count = len(current_state().operations)
-
     return [
         types.Tool(
             name=STATUS_TOOL_NAME,
@@ -679,15 +721,7 @@ def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name=FIND_TOOL_NAME,
-            description=(
-                f"Search the {operation_count} live Nextcloud API operations available on the "
-                f"connected instance and return their names, HTTP method, path and summary. "
-                f"Start here, then call `{DESCRIBE_TOOL_NAME}` for the arguments of the "
-                f"operations you picked, then `{CALL_TOOL_NAME}` to run one. "
-                f"Use this only for real operations against the configured Nextcloud server, "
-                f"not for documentation lookup or local workspace tasks. "
-                f"Apps on this instance (id:operations) - {app_index()}."
-            ),
+            description=find_tool_description(authenticated),
             input_schema={
                 "type": "object",
                 "properties": {
@@ -877,10 +911,36 @@ async def on_list_tools(
     params: types.PaginatedRequestParams | None,
 ) -> types.ListToolsResult:
     await refresh_state()
-    return types.ListToolsResult(tools=list_tools())
+    authenticated = execution_auth_context(ctx).auth_header is not None
+    return types.ListToolsResult(tools=list_tools(authenticated))
 
 
-def find_result(arguments: dict[str, Any]) -> types.CallToolResult:
+def missing_credentials_result(tool_name: str) -> types.CallToolResult:
+    return tool_result(
+        {
+            "ok": False,
+            "error": (
+                "Missing request credentials for this tool call. Configure MCP HTTP headers "
+                "`X-Nextcloud-Username` and `X-Nextcloud-AppToken`. "
+                "Server discovery credentials are not used for tool execution over HTTP."
+            ),
+            "tool_name": tool_name,
+        },
+        is_error=True,
+    )
+
+
+def find_result(arguments: dict[str, Any], auth_context: AuthContext) -> types.CallToolResult:
+    """Searching the catalogue is gated as tightly as executing against it.
+
+    The catalogue names every app the instance has installed and every API path
+    it exposes. Leaving search open let anyone who knew the endpoint URL
+    enumerate that, which is the reconnaissance half of an attack even though
+    execution itself stayed credentialed.
+    """
+    if not auth_context.auth_header:
+        return missing_credentials_result(FIND_TOOL_NAME)
+
     requested_limit = arguments.get("limit") or FIND_DEFAULT_LIMIT
     try:
         limit = max(1, min(int(requested_limit), FIND_MAX_LIMIT))
@@ -899,7 +959,10 @@ def find_result(arguments: dict[str, Any]) -> types.CallToolResult:
     )
 
 
-def describe_result(arguments: dict[str, Any]) -> types.CallToolResult:
+def describe_result(arguments: dict[str, Any], auth_context: AuthContext) -> types.CallToolResult:
+    if not auth_context.auth_header:
+        return missing_credentials_result(DESCRIBE_TOOL_NAME)
+
     names = arguments.get("names") or []
     if isinstance(names, str):
         names = [names]
@@ -932,6 +995,12 @@ async def call_result(
     arguments: dict[str, Any],
     auth_context: AuthContext,
 ) -> types.CallToolResult:
+    # Credentials are checked before the lookup: `did_you_mean` is built from
+    # the catalogue, so answering an unknown name first would let an anonymous
+    # caller enumerate operations one guess at a time.
+    if not auth_context.auth_header:
+        return missing_credentials_result(CALL_TOOL_NAME)
+
     operation_name = arguments.get("name")
     definition = current_state().operations.get(operation_name)
     if definition is None:
@@ -940,20 +1009,6 @@ async def call_result(
                 "ok": False,
                 "error": f"Unknown operation: {operation_name}",
                 "did_you_mean": suggest_operation_names(operation_name),
-            },
-            is_error=True,
-        )
-
-    if not auth_context.auth_header:
-        return tool_result(
-            {
-                "ok": False,
-                "error": (
-                    "Missing request credentials for this tool call. Configure MCP HTTP headers "
-                    "`X-Nextcloud-Username` and `X-Nextcloud-AppToken`. "
-                    "Server discovery credentials are not used for tool execution over HTTP."
-                ),
-                "tool_name": definition.name,
             },
             is_error=True,
         )
@@ -973,16 +1028,21 @@ async def on_call_tool(
     auth_context = execution_auth_context(ctx)
 
     if params.name == STATUS_TOOL_NAME:
+        # A forced refresh makes the server re-fetch every app's OpenAPI document
+        # with its own discovery credentials. Leaving that open to anonymous
+        # callers turns one unauthenticated request into ~29 upstream ones.
         if arguments.get("refresh"):
+            if not auth_context.auth_header:
+                return missing_credentials_result(STATUS_TOOL_NAME)
             await refresh_state(force=True)
         return tool_result(discovery_status_payload(auth_context))
 
     await refresh_state()
 
     if params.name == FIND_TOOL_NAME:
-        return find_result(arguments)
+        return find_result(arguments, auth_context)
     if params.name == DESCRIBE_TOOL_NAME:
-        return describe_result(arguments)
+        return describe_result(arguments, auth_context)
     if params.name == CALL_TOOL_NAME:
         return await call_result(arguments, auth_context)
 

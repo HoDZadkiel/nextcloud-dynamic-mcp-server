@@ -22,6 +22,18 @@ META_TOOL_NAMES = [
     main.CALL_TOOL_NAME,
 ]
 
+AUTH_HEADERS = {
+    "X-Nextcloud-Username": "alice",
+    "X-Nextcloud-AppToken": "alice-token",
+}
+
+
+def call_headers(tool_name, authenticated=True):
+    headers = {"Mcp-Name": tool_name}
+    if authenticated:
+        headers.update(AUTH_HEADERS)
+    return headers
+
 
 def make_state(**kwargs) -> main.DiscoveryState:
     return main.DiscoveryState(**kwargs)
@@ -498,7 +510,7 @@ def test_find_ranks_a_name_match_above_a_summary_only_match():
             client,
             "tools/call",
             {"name": main.FIND_TOOL_NAME, "arguments": {"query": "page create"}},
-            {"Mcp-Name": main.FIND_TOOL_NAME},
+            call_headers(main.FIND_TOOL_NAME),
         ),
         operations=operations,
     )["result"]["structuredContent"]
@@ -517,7 +529,7 @@ def test_find_reports_truncation_so_the_caller_knows_to_narrow():
             client,
             "tools/call",
             {"name": main.FIND_TOOL_NAME, "arguments": {"query": "page", "limit": 5}},
-            {"Mcp-Name": main.FIND_TOOL_NAME},
+            call_headers(main.FIND_TOOL_NAME),
         ),
         operations=operations,
     )["result"]["structuredContent"]
@@ -538,7 +550,7 @@ def test_find_restricted_to_an_app_excludes_other_apps():
             client,
             "tools/call",
             {"name": main.FIND_TOOL_NAME, "arguments": {"query": "get", "app": "collectives"}},
-            {"Mcp-Name": main.FIND_TOOL_NAME},
+            call_headers(main.FIND_TOOL_NAME),
         ),
         operations=operations,
     )["result"]["structuredContent"]
@@ -565,7 +577,7 @@ def test_describe_returns_the_schema_that_is_no_longer_in_the_tool_list():
                 "name": main.DESCRIBE_TOOL_NAME,
                 "arguments": {"names": ["collectives_page_create"]},
             },
-            {"Mcp-Name": main.DESCRIBE_TOOL_NAME},
+            call_headers(main.DESCRIBE_TOOL_NAME),
         ),
         operations=operations,
     )["result"]["structuredContent"]
@@ -584,7 +596,7 @@ def test_describe_suggests_alternatives_for_an_unknown_name():
             client,
             "tools/call",
             {"name": main.DESCRIBE_TOOL_NAME, "arguments": {"names": ["collectives_create_page"]}},
-            {"Mcp-Name": main.DESCRIBE_TOOL_NAME},
+            call_headers(main.DESCRIBE_TOOL_NAME),
         ),
         operations=operations,
     )["result"]["structuredContent"]
@@ -604,11 +616,7 @@ def test_call_rejects_an_unknown_operation_without_reaching_nextcloud():
                 "name": main.CALL_TOOL_NAME,
                 "arguments": {"name": "collectives_page_nope", "arguments": {}},
             },
-            {
-                "Mcp-Name": main.CALL_TOOL_NAME,
-                "X-Nextcloud-Username": "alice",
-                "X-Nextcloud-AppToken": "alice-token",
-            },
+            call_headers(main.CALL_TOOL_NAME),
         ),
         operations=operations,
     )["result"]["structuredContent"]
@@ -630,13 +638,161 @@ def test_call_without_credentials_still_refuses_after_the_meta_tool_rewrite():
                 "name": main.CALL_TOOL_NAME,
                 "arguments": {"name": "collectives_page_create", "arguments": {}},
             },
-            {"Mcp-Name": main.CALL_TOOL_NAME},
+            call_headers(main.CALL_TOOL_NAME, authenticated=False),
         ),
         operations=operations,
     )["result"]["structuredContent"]
 
     assert result["ok"] is False
     assert "Missing request credentials" in result["error"]
+
+
+# --- discovery is gated as tightly as execution ------------------------------
+#
+# Execution was credentialed from the start, but searching the catalogue was
+# not. The catalogue names every installed app and every API path it exposes,
+# so leaving it open let anyone who knew the endpoint URL enumerate the whole
+# instance - reconnaissance, even though they could not then call anything.
+
+
+def test_find_without_credentials_refuses():
+    operations = catalogue(make_operation("collectives_page_create", summary="Create a page"))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.FIND_TOOL_NAME, "arguments": {"query": "page"}},
+            call_headers(main.FIND_TOOL_NAME, authenticated=False),
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert "Missing request credentials" in result["error"]
+    assert "operations" not in result
+
+
+def test_describe_without_credentials_refuses():
+    operations = catalogue(make_operation("collectives_page_create"))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.DESCRIBE_TOOL_NAME, "arguments": {"names": ["collectives_page_create"]}},
+            call_headers(main.DESCRIBE_TOOL_NAME, authenticated=False),
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert "operations" not in result
+
+
+def test_unknown_operation_without_credentials_does_not_leak_suggestions():
+    """did_you_mean is built from the catalogue, so answering an unknown name
+    before checking credentials would let an anonymous caller enumerate
+    operations one guess at a time."""
+    operations = catalogue(make_operation("collectives_page_create", summary="Create a page"))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {
+                "name": main.CALL_TOOL_NAME,
+                "arguments": {"name": "collectives_page_nope", "arguments": {}},
+            },
+            call_headers(main.CALL_TOOL_NAME, authenticated=False),
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert "did_you_mean" not in result
+
+
+def test_find_tool_description_hides_the_app_index_without_credentials():
+    """The find tool's own description carries the app inventory, so it leaks
+    through tools/list even when the tool itself refuses to run."""
+    apps = [{"id": "collectives", "name": "Collectives", "operation_count": 84}]
+
+    anonymous = run_mcp(lambda client: post_mcp(client, "tools/list"), apps=apps)["result"]
+    credentialed = run_mcp(
+        lambda client: post_mcp(client, "tools/list", headers=AUTH_HEADERS), apps=apps
+    )["result"]
+
+    def find_description(result):
+        return next(t for t in result["tools"] if t["name"] == main.FIND_TOOL_NAME)["description"]
+
+    assert "collectives:84" not in find_description(anonymous)
+    assert "collectives:84" in find_description(credentialed)
+
+
+def test_status_without_credentials_hides_the_instance():
+    """GET / is deliberately trimmed of these fields; that is pointless if the
+    status tool hands them to anyone who can reach /mcp."""
+    apps = [{"id": "collectives", "name": "Collectives", "operation_count": 84}]
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.STATUS_TOOL_NAME, "arguments": {}},
+            {"Mcp-Name": main.STATUS_TOOL_NAME},
+        ),
+        apps=apps,
+    )["result"]["structuredContent"]
+
+    assert "nextcloud_url" not in result
+    assert "api_viewer_url" not in result
+    assert "apps" not in result
+    assert "last_error" not in result
+    # The caller's own auth diagnostics stay open - that is how someone whose
+    # credentials are not working finds out why.
+    assert result["request_auth_configured"] is False
+    assert result["app_count"] == 1
+
+
+def test_status_with_credentials_reports_the_instance():
+    apps = [{"id": "collectives", "name": "Collectives", "operation_count": 84}]
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.STATUS_TOOL_NAME, "arguments": {}},
+            call_headers(main.STATUS_TOOL_NAME),
+        ),
+        apps=apps,
+    )["result"]["structuredContent"]
+
+    assert result["nextcloud_url"] == main.NEXTCLOUD_URL
+    assert [app["id"] for app in result["apps"]] == ["collectives"]
+
+
+def test_status_refresh_requires_credentials():
+    """A forced refresh re-fetches every app's OpenAPI document using the
+    server's own credentials, so anonymous access turns one request into ~29
+    upstream ones."""
+    operations = catalogue(make_operation("collectives_page_create"))
+
+    payload = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.STATUS_TOOL_NAME, "arguments": {"refresh": True}},
+            {"Mcp-Name": main.STATUS_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert payload["ok"] is False
+    assert "Missing request credentials" in payload["error"]
+    # Discovery would have failed against the unreachable test URL and wiped the
+    # catalogue; it surviving proves the refresh never ran.
+    assert len(main.DISCOVERY_STATE.operations) == 1
 
 
 def test_healthcheck_does_not_leak_the_nextcloud_url():
