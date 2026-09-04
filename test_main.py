@@ -15,9 +15,39 @@ import main
 
 PROTOCOL_VERSION = "2026-07-28"
 
+META_TOOL_NAMES = [
+    main.STATUS_TOOL_NAME,
+    main.FIND_TOOL_NAME,
+    main.DESCRIBE_TOOL_NAME,
+    main.CALL_TOOL_NAME,
+]
+
 
 def make_state(**kwargs) -> main.DiscoveryState:
     return main.DiscoveryState(**kwargs)
+
+
+def make_operation(name, app_id="collectives", summary="", path="/x", **kwargs) -> main.OperationDefinition:
+    defaults = dict(
+        app_name=app_id,
+        method="GET",
+        description=summary,
+        input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+        path_params=[],
+        query_params=[],
+        header_params=[],
+        body_mode="none",
+        body_fields=[],
+        body_content_type=None,
+    )
+    defaults.update(kwargs)
+    return main.OperationDefinition(
+        name=name, app_id=app_id, summary=summary, path=path, **defaults
+    )
+
+
+def catalogue(*definitions) -> dict[str, main.OperationDefinition]:
+    return {definition.name: definition for definition in definitions}
 
 
 class FakeRequest:
@@ -123,6 +153,154 @@ def test_flattened_body_sends_only_supplied_fields():
     assert form_body is None and raw_body is None
 
 
+# --- schema $ref resolution --------------------------------------------------
+#
+# An MCP client only ever receives a tool's inputSchema, never the OpenAPI
+# document it was extracted from. A surviving `#/components/schemas/...` pointer
+# is therefore unresolvable on the client side, and strict clients (opencode)
+# fail the whole tool list over it.
+
+
+def json_of(schema) -> str:
+    import json
+
+    return json.dumps(schema)
+
+
+def test_nested_ref_is_inlined_into_tool_schema():
+    """files_template_create's real body: templateFields[].$ref -> TemplateField."""
+    document = {
+        "components": {
+            "schemas": {
+                "TemplateField": {
+                    "type": "object",
+                    "required": ["index", "type"],
+                    "properties": {"index": {"type": "string"}, "type": {"type": "string"}},
+                }
+            }
+        }
+    }
+    request_body = {
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "required": ["filePath"],
+                    "properties": {
+                        "filePath": {"type": "string"},
+                        "templateFields": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/TemplateField"},
+                        },
+                    },
+                }
+            }
+        },
+    }
+
+    schema, body_mode, body_fields, _, _, _, _ = main.build_input_schema([], request_body, document)
+
+    assert body_mode == "flattened_json_object"
+    assert body_fields == ["filePath", "templateFields"]
+    assert schema["properties"]["templateFields"]["items"]["properties"]["index"] == {"type": "string"}
+    assert "$ref" not in json_of(schema)
+
+
+def test_ref_siblings_are_kept_alongside_the_resolved_target():
+    """spreed's `parts` carries $ref plus default/description on the same node;
+    dropping the siblings would lose the argument's documentation."""
+    document = {"components": {"schemas": {"Parts": {"type": "array", "items": {"type": "object"}}}}}
+    request_body = {
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "enabled": {"type": "boolean"},
+                        "parts": {
+                            "$ref": "#/components/schemas/Parts",
+                            "default": [],
+                            "description": "New parts",
+                        },
+                    },
+                }
+            }
+        }
+    }
+
+    schema, _, _, _, _, _, _ = main.build_input_schema([], request_body, document)
+
+    parts = schema["properties"]["parts"]
+    assert parts["type"] == "array"
+    assert parts["items"] == {"type": "object"}
+    assert parts["description"] == "New parts"
+    assert parts["default"] == []
+
+
+def test_recursive_ref_is_truncated_instead_of_hanging():
+    """No Nextcloud schema is self-referential today, but one appearing later must
+    truncate rather than recurse forever while building the tool list."""
+    document = {
+        "components": {
+            "schemas": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "label": {"type": "string"},
+                        "children": {
+                            "type": "array",
+                            "items": {"$ref": "#/components/schemas/Node"},
+                        },
+                    },
+                }
+            }
+        }
+    }
+    request_body = {
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Node"}}}
+    }
+
+    schema, body_mode, _, _, _, _, _ = main.build_input_schema([], request_body, document)
+
+    assert body_mode == "flattened_json_object"
+    assert "$ref" not in json_of(schema)
+    assert schema["properties"]["label"] == {"type": "string"}
+    # The cycle is cut the second time Node is reached, leaving a permissive
+    # object rather than another expansion.
+    assert schema["properties"]["children"]["items"] == {
+        "type": "object",
+        "description": "Unexpanded schema (Node)",
+    }
+
+
+def test_unresolvable_ref_degrades_to_a_generic_object():
+    """A pointer we cannot follow must not crash discovery nor leak the pointer;
+    the argument stays usable as a free-form object."""
+    parameters = [
+        {"name": "filter", "in": "query", "schema": {"$ref": "#/components/schemas/Nope"}},
+    ]
+
+    schema, _, _, _, _, query_params, _ = main.build_input_schema(parameters, None, {"components": {}})
+
+    assert query_params == ["filter"]
+    assert schema["properties"]["filter"]["type"] == "object"
+    assert "$ref" not in json_of(schema)
+
+
+def test_refs_are_stripped_even_without_a_document():
+    """build_input_schema is reachable without the spec root; the schema it
+    returns still has to be self-contained."""
+    request_body = {
+        "content": {"application/json": {"schema": {"$ref": "#/components/schemas/Whatever"}}}
+    }
+
+    schema, body_mode, _, _, _, _, _ = main.build_input_schema([], request_body)
+
+    assert body_mode == "body"
+    assert "$ref" not in json_of(schema)
+
+
 # --- tool naming -------------------------------------------------------------
 
 
@@ -224,7 +402,7 @@ async def post_mcp(client, method, params=None, headers=None):
     return response.json()
 
 
-def run_mcp(coro_factory):
+def run_mcp(coro_factory, operations=None, apps=None):
     """Each run gets a fresh app: a StreamableHTTPSessionManager may only be
     started once, so the module-level instance cannot be reused across tests."""
 
@@ -234,8 +412,8 @@ def run_mcp(coro_factory):
             # Overwrite the state the lifespan's startup discovery just produced,
             # so the assertions below do not depend on a reachable Nextcloud.
             main.DISCOVERY_STATE = make_state(
-                operations={},
-                apps=[],
+                operations=operations or {},
+                apps=apps or [],
                 last_refresh=main.now_iso(),
                 last_attempt=time.monotonic(),
             )
@@ -261,7 +439,7 @@ def test_tools_list_carries_cache_hints():
 
     assert result["ttlMs"] == main.TOOL_LIST_TTL_MS
     assert result["cacheScope"] == "private"
-    assert [tool["name"] for tool in result["tools"]] == [main.STATUS_TOOL_NAME]
+    assert [tool["name"] for tool in result["tools"]] == META_TOOL_NAMES
 
 
 def test_status_tool_reports_caller_credentials_from_request_headers():
@@ -295,6 +473,170 @@ def test_unknown_tool_is_rejected_as_invalid_params():
     )["error"]
 
     assert error["code"] == -32602
+
+
+def test_tool_surface_stays_fixed_however_many_operations_are_discovered():
+    """The point of the meta-tool surface: a 550-operation instance must not put
+    550 schemas into every client's context before a single call is made."""
+    operations = catalogue(*(make_operation(f"app_op_{index}") for index in range(400)))
+
+    result = run_mcp(lambda client: post_mcp(client, "tools/list"), operations=operations)["result"]
+
+    assert [tool["name"] for tool in result["tools"]] == META_TOOL_NAMES
+
+
+def test_find_ranks_a_name_match_above_a_summary_only_match():
+    """Searching `page create` has to surface the create operation itself, not
+    every operation whose prose happens to mention creating pages."""
+    operations = catalogue(
+        make_operation("collectives_page_create", summary="Create a page"),
+        make_operation("collectives_page_trash", summary="Trash a page you did not create"),
+    )
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.FIND_TOOL_NAME, "arguments": {"query": "page create"}},
+            {"Mcp-Name": main.FIND_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert [row["name"] for row in result["operations"]] == [
+        "collectives_page_create",
+        "collectives_page_trash",
+    ]
+
+
+def test_find_reports_truncation_so_the_caller_knows_to_narrow():
+    operations = catalogue(*(make_operation(f"collectives_page_{index}") for index in range(50)))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.FIND_TOOL_NAME, "arguments": {"query": "page", "limit": 5}},
+            {"Mcp-Name": main.FIND_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["total_matches"] == 50
+    assert result["returned"] == 5
+    assert result["truncated"] is True
+
+
+def test_find_restricted_to_an_app_excludes_other_apps():
+    operations = catalogue(
+        make_operation("collectives_page_get", summary="Get a page"),
+        make_operation("spreed_room_get", app_id="spreed", summary="Get a room page"),
+    )
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.FIND_TOOL_NAME, "arguments": {"query": "get", "app": "collectives"}},
+            {"Mcp-Name": main.FIND_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert [row["name"] for row in result["operations"]] == ["collectives_page_get"]
+
+
+def test_describe_returns_the_schema_that_is_no_longer_in_the_tool_list():
+    """The schema left tools/list, so describe is now the only way a caller can
+    learn an operation's arguments. If it stops carrying them, calls go blind."""
+    schema = {
+        "type": "object",
+        "properties": {"title": {"type": "string"}},
+        "required": ["title"],
+        "additionalProperties": False,
+    }
+    operations = catalogue(make_operation("collectives_page_create", input_schema=schema))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {
+                "name": main.DESCRIBE_TOOL_NAME,
+                "arguments": {"names": ["collectives_page_create"]},
+            },
+            {"Mcp-Name": main.DESCRIBE_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is True
+    assert result["operations"][0]["input_schema"] == schema
+
+
+def test_describe_suggests_alternatives_for_an_unknown_name():
+    """Without the tool list to autocomplete against, a near-miss name is the
+    normal failure mode; it has to be recoverable without a second search."""
+    operations = catalogue(make_operation("collectives_page_create", summary="Create a page"))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.DESCRIBE_TOOL_NAME, "arguments": {"names": ["collectives_create_page"]}},
+            {"Mcp-Name": main.DESCRIBE_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert result["unknown"][0]["did_you_mean"] == ["collectives_page_create"]
+
+
+def test_call_rejects_an_unknown_operation_without_reaching_nextcloud():
+    operations = catalogue(make_operation("collectives_page_create", summary="Create a page"))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {
+                "name": main.CALL_TOOL_NAME,
+                "arguments": {"name": "collectives_page_nope", "arguments": {}},
+            },
+            {
+                "Mcp-Name": main.CALL_TOOL_NAME,
+                "X-Nextcloud-Username": "alice",
+                "X-Nextcloud-AppToken": "alice-token",
+            },
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert result["did_you_mean"] == ["collectives_page_create"]
+
+
+def test_call_without_credentials_still_refuses_after_the_meta_tool_rewrite():
+    """Execution used to be gated per dynamic tool. Routing every call through
+    one tool must not let an uncredentialed caller reach Nextcloud."""
+    operations = catalogue(make_operation("collectives_page_create"))
+
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {
+                "name": main.CALL_TOOL_NAME,
+                "arguments": {"name": "collectives_page_create", "arguments": {}},
+            },
+            {"Mcp-Name": main.CALL_TOOL_NAME},
+        ),
+        operations=operations,
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert "Missing request credentials" in result["error"]
 
 
 def test_healthcheck_does_not_leak_the_nextcloud_url():

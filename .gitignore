@@ -3,4 +3,19 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# 憑證與機密
 .env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+
+# 本機備份快照
+*.7z
+*.zip
+
+# 開發紀錄：會累積實例主機名等內網細節，不進公開 repo
+DEVLOG.md

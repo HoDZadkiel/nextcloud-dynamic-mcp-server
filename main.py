@@ -48,7 +48,14 @@ CORS_ALLOW_ORIGINS = [
 ]
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete"}
+MAX_REF_DEPTH = 8
 STATUS_TOOL_NAME = "nextcloud_discovery_status"
+FIND_TOOL_NAME = "nextcloud_find_operations"
+DESCRIBE_TOOL_NAME = "nextcloud_describe_operations"
+CALL_TOOL_NAME = "nextcloud_call_operation"
+FIND_DEFAULT_LIMIT = 30
+FIND_MAX_LIMIT = 200
+SUGGESTION_LIMIT = 5
 INTERNAL_HEADER_PARAMS = {"ocs-apirequest", "authorization"}
 SERVER_NAME = "nextcloud-live-instance-mcp"
 SERVER_VERSION = "2.0.0"
@@ -134,6 +141,73 @@ def enrich_schema(schema: dict[str, Any], description: str | None) -> dict[str, 
     return enriched
 
 
+def resolve_json_pointer(document: dict[str, Any] | None, pointer: str) -> Any:
+    if not isinstance(document, dict) or not pointer.startswith("#/"):
+        return None
+
+    node: Any = document
+    for token in pointer[2:].split("/"):
+        key = token.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict):
+            if key not in node:
+                return None
+            node = node[key]
+        elif isinstance(node, list):
+            try:
+                node = node[int(key)]
+            except (ValueError, IndexError):
+                return None
+        else:
+            return None
+    return node
+
+
+def truncated_ref_schema(pointer: str) -> dict[str, Any]:
+    # No additionalProperties: False here - the real shape is unknown, so the
+    # placeholder has to keep accepting whatever the caller sends.
+    return {"type": "object", "description": f"Unexpanded schema ({pointer.rsplit('/', 1)[-1]})"}
+
+
+def resolve_schema_refs(
+    schema: Any,
+    document: dict[str, Any] | None,
+    ref_stack: tuple[str, ...] = (),
+    depth: int = 0,
+) -> Any:
+    """Inline every `$ref` so the published inputSchema stands on its own.
+
+    MCP clients only ever see a tool's inputSchema, never the OpenAPI document it
+    came from, so a surviving `#/components/schemas/...` pointer is unresolvable
+    on their side and can take out the whole tool list.
+    """
+    if isinstance(schema, list):
+        return [resolve_schema_refs(item, document, ref_stack, depth) for item in schema]
+
+    if not isinstance(schema, dict):
+        return copy.deepcopy(schema)
+
+    pointer = schema.get("$ref")
+    if not isinstance(pointer, str):
+        return {key: resolve_schema_refs(value, document, ref_stack, depth) for key, value in schema.items()}
+
+    siblings = {
+        key: resolve_schema_refs(value, document, ref_stack, depth)
+        for key, value in schema.items()
+        if key != "$ref"
+    }
+
+    if pointer in ref_stack or depth >= MAX_REF_DEPTH:
+        return {**truncated_ref_schema(pointer), **siblings}
+
+    target = resolve_json_pointer(document, pointer)
+    if not isinstance(target, dict):
+        logger.warning("Unresolvable schema reference %s, falling back to a generic object", pointer)
+        return {**truncated_ref_schema(pointer), **siblings}
+
+    resolved = resolve_schema_refs(target, document, ref_stack + (pointer,), depth + 1)
+    return {**resolved, **siblings}
+
+
 def merge_parameters(
     path_parameters: list[dict[str, Any]],
     operation_parameters: list[dict[str, Any]],
@@ -169,6 +243,7 @@ def preferred_content_type(content: dict[str, Any]) -> str | None:
 def build_input_schema(
     parameters: list[dict[str, Any]],
     request_body: dict[str, Any] | None,
+    document: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], str, list[str], str | None, list[str], list[str], list[str]]:
     properties: dict[str, Any] = {}
     required: list[str] = []
@@ -181,7 +256,8 @@ def build_input_schema(
         location = parameter["in"]
         if location == "header" and name.lower() in INTERNAL_HEADER_PARAMS:
             continue
-        schema = enrich_schema(parameter.get("schema", {}), parameter.get("description"))
+        resolved = resolve_schema_refs(parameter.get("schema", {}), document)
+        schema = enrich_schema(resolved, parameter.get("description"))
         properties[name] = schema
         if parameter.get("required"):
             required.append(name)
@@ -199,7 +275,12 @@ def build_input_schema(
     if request_body:
         content = request_body.get("content", {})
         body_content_type = preferred_content_type(content)
-        body_schema = clone_schema(content.get(body_content_type, {}).get("schema", {}))
+        # Resolved before the flatten check below, otherwise a body that is itself
+        # a single `$ref` would look like a non-object and never get flattened.
+        body_schema = resolve_schema_refs(
+            clone_schema(content.get(body_content_type, {}).get("schema", {})),
+            document,
+        )
 
         can_flatten = (
             body_content_type is not None
@@ -232,6 +313,9 @@ def build_input_schema(
         "required": unique_names(required),
         "additionalProperties": False,
     }
+    # Last line of defence: whatever the document did or did not contain, no `$ref`
+    # may reach the client. Passing document=None degrades any survivor to an object.
+    input_schema = resolve_schema_refs(input_schema, None)
     return (
         input_schema,
         body_mode,
@@ -249,6 +333,7 @@ def make_operation_definition(
     method: str,
     operation: dict[str, Any],
     inherited_parameters: list[dict[str, Any]],
+    document: dict[str, Any] | None = None,
 ) -> OperationDefinition:
     parameters = merge_parameters(inherited_parameters, operation.get("parameters", []))
     (
@@ -259,7 +344,7 @@ def make_operation_definition(
         path_params,
         query_params,
         header_params,
-    ) = build_input_schema(parameters, operation.get("requestBody"))
+    ) = build_input_schema(parameters, operation.get("requestBody"), document)
 
     summary = operation.get("summary") or f"{method.upper()} {path}"
     description = operation.get("description") or summary
@@ -404,6 +489,7 @@ async def discover_operations(auth_context: AuthContext) -> DiscoveryState:
                         method=method,
                         operation=operation,
                         inherited_parameters=inherited_parameters,
+                        document=openapi,
                     )
                     operations[definition.name] = definition
                     app_operation_count += 1
@@ -486,19 +572,94 @@ def discovery_status_payload(request_context: AuthContext) -> dict[str, Any]:
     }
 
 
-def dynamic_tool_description(definition: OperationDefinition) -> str:
-    return (
-        f"Live Nextcloud API tool for the connected instance. "
-        f"App: {definition.app_id} ({definition.app_name}). "
-        f"Action: {definition.summary}. "
-        f"Use this only for real operations against the configured Nextcloud server, "
-        f"not for documentation lookup or local workspace tasks."
-    )
+def operation_row(definition: OperationDefinition) -> dict[str, Any]:
+    return {
+        "name": definition.name,
+        "method": definition.method,
+        "path": definition.path,
+        "summary": definition.summary,
+    }
+
+
+def operation_haystack(definition: OperationDefinition) -> str:
+    return f"{definition.name} {definition.summary} {definition.path} {definition.app_name}".lower()
+
+
+def term_score(definition: OperationDefinition, terms: list[str]) -> int:
+    """A term hitting the operation name counts double, which keeps
+    `collectives_page_create` ahead of operations that merely mention pages in
+    their summary."""
+    name = definition.name.lower()
+    haystack = operation_haystack(definition)
+    return sum(2 if term in name else 1 if term in haystack else 0 for term in terms)
+
+
+def search_operations(
+    query: str | None,
+    app: str | None,
+    limit: int,
+) -> tuple[list[OperationDefinition], int]:
+    """Rank discovered operations against a free-text query.
+
+    Every term has to appear somewhere in an operation's searchable text, so
+    adding a term always narrows the result.
+    """
+    terms = (query or "").lower().split()
+    app_filter = (app or "").strip().lower()
+
+    scored: list[tuple[int, str, OperationDefinition]] = []
+    for definition in current_state().operations.values():
+        if app_filter and definition.app_id.lower() != app_filter:
+            continue
+        if not all(term in operation_haystack(definition) for term in terms):
+            continue
+        scored.append((-term_score(definition, terms), definition.name, definition))
+
+    scored.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in scored[:limit]], len(scored)
+
+
+def suggest_operation_names(name: Any) -> list[str]:
+    """Recover from a near-miss operation name.
+
+    Deliberately not `search_operations`: the whole premise of a did-you-mean is
+    that one of the caller's terms is wrong, so requiring every term to match -
+    which is what makes the search itself useful - would return nothing exactly
+    when a suggestion is needed. Any term may match here, best overlap first.
+    """
+    terms = str(name or "").replace("_", " ").lower().split()
+    if not terms:
+        return []
+
+    scored: list[tuple[int, str]] = []
+    for definition in current_state().operations.values():
+        score = term_score(definition, terms)
+        if score:
+            scored.append((-score, definition.name))
+
+    scored.sort()
+    return [item[1] for item in scored[:SUGGESTION_LIMIT]]
+
+
+def app_index() -> str:
+    apps = current_state().apps
+    if not apps:
+        return f"none discovered yet - call {STATUS_TOOL_NAME}"
+    return ", ".join(f"{app['id']}:{app['operation_count']}" for app in apps)
 
 
 def list_tools() -> list[types.Tool]:
-    state = current_state()
-    static_tools = [
+    """Publish a fixed four-tool surface instead of one tool per operation.
+
+    An instance with every app enabled discovers ~550 operations. Publishing
+    those as ~550 tools puts roughly 100k tokens of schema into every client's
+    context before a single call is made, and no session uses more than a
+    handful of them. The catalogue is searched on demand instead, which costs
+    one extra round trip and about 1k tokens of context.
+    """
+    operation_count = len(current_state().operations)
+
+    return [
         types.Tool(
             name=STATUS_TOOL_NAME,
             description=(
@@ -516,18 +677,91 @@ def list_tools() -> list[types.Tool]:
                 "additionalProperties": False,
             },
         ),
-    ]
-
-    dynamic_tools = [
         types.Tool(
-            name=definition.name,
-            description=dynamic_tool_description(definition),
-            input_schema=definition.input_schema,
-        )
-        for definition in sorted(state.operations.values(), key=lambda item: item.name)
+            name=FIND_TOOL_NAME,
+            description=(
+                f"Search the {operation_count} live Nextcloud API operations available on the "
+                f"connected instance and return their names, HTTP method, path and summary. "
+                f"Start here, then call `{DESCRIBE_TOOL_NAME}` for the arguments of the "
+                f"operations you picked, then `{CALL_TOOL_NAME}` to run one. "
+                f"Use this only for real operations against the configured Nextcloud server, "
+                f"not for documentation lookup or local workspace tasks. "
+                f"Apps on this instance (id:operations) - {app_index()}."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "Space-separated terms matched against operation name, summary, "
+                            "path and app name. Every term must match, so more terms narrow "
+                            "the result. Omit to list an app in full."
+                        ),
+                    },
+                    "app": {
+                        "type": "string",
+                        "description": "Restrict the search to one app id, e.g. `collectives`.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": FIND_MAX_LIMIT,
+                        "description": f"Maximum operations to return. Defaults to {FIND_DEFAULT_LIMIT}.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name=DESCRIBE_TOOL_NAME,
+            description=(
+                f"Return the full JSON Schema of one or more operations found with "
+                f"`{FIND_TOOL_NAME}`, so their arguments can be filled in correctly. "
+                f"Ask for every operation you are about to use in a single call."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "names": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": f"Operation names as returned by `{FIND_TOOL_NAME}`.",
+                    }
+                },
+                "required": ["names"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name=CALL_TOOL_NAME,
+            description=(
+                f"Execute one Nextcloud API operation against the connected instance. "
+                f"Look the operation up with `{FIND_TOOL_NAME}` and check its schema with "
+                f"`{DESCRIBE_TOOL_NAME}` before calling, because `arguments` is passed "
+                f"through unvalidated."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": f"Operation name as returned by `{FIND_TOOL_NAME}`.",
+                    },
+                    "arguments": {
+                        "type": "object",
+                        "description": (
+                            "Arguments for the operation, shaped by the `input_schema` that "
+                            f"`{DESCRIBE_TOOL_NAME}` returns for it."
+                        ),
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["name"],
+                "additionalProperties": False,
+            },
+        ),
     ]
-
-    return static_tools + dynamic_tools
 
 
 def build_request_body(definition: OperationDefinition, arguments: dict[str, Any]) -> tuple[Any, Any, Any]:
@@ -646,6 +880,91 @@ async def on_list_tools(
     return types.ListToolsResult(tools=list_tools())
 
 
+def find_result(arguments: dict[str, Any]) -> types.CallToolResult:
+    requested_limit = arguments.get("limit") or FIND_DEFAULT_LIMIT
+    try:
+        limit = max(1, min(int(requested_limit), FIND_MAX_LIMIT))
+    except (TypeError, ValueError):
+        limit = FIND_DEFAULT_LIMIT
+
+    matches, total = search_operations(arguments.get("query"), arguments.get("app"), limit)
+    return tool_result(
+        {
+            "ok": True,
+            "total_matches": total,
+            "returned": len(matches),
+            "truncated": total > len(matches),
+            "operations": [operation_row(definition) for definition in matches],
+        }
+    )
+
+
+def describe_result(arguments: dict[str, Any]) -> types.CallToolResult:
+    names = arguments.get("names") or []
+    if isinstance(names, str):
+        names = [names]
+
+    state = current_state()
+    described: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+
+    for name in names:
+        definition = state.operations.get(name)
+        if definition is None:
+            unknown.append({"name": name, "did_you_mean": suggest_operation_names(name)})
+            continue
+        described.append(
+            {
+                **operation_row(definition),
+                "app_id": definition.app_id,
+                "description": definition.description,
+                "input_schema": definition.input_schema,
+            }
+        )
+
+    payload: dict[str, Any] = {"ok": not unknown, "operations": described}
+    if unknown:
+        payload["unknown"] = unknown
+    return tool_result(payload, is_error=not described)
+
+
+async def call_result(
+    arguments: dict[str, Any],
+    auth_context: AuthContext,
+) -> types.CallToolResult:
+    operation_name = arguments.get("name")
+    definition = current_state().operations.get(operation_name)
+    if definition is None:
+        return tool_result(
+            {
+                "ok": False,
+                "error": f"Unknown operation: {operation_name}",
+                "did_you_mean": suggest_operation_names(operation_name),
+            },
+            is_error=True,
+        )
+
+    if not auth_context.auth_header:
+        return tool_result(
+            {
+                "ok": False,
+                "error": (
+                    "Missing request credentials for this tool call. Configure MCP HTTP headers "
+                    "`X-Nextcloud-Username` and `X-Nextcloud-AppToken`. "
+                    "Server discovery credentials are not used for tool execution over HTTP."
+                ),
+                "tool_name": definition.name,
+            },
+            is_error=True,
+        )
+
+    try:
+        payload = await execute_operation(definition, arguments.get("arguments") or {}, auth_context)
+    except ValueError as exc:
+        return tool_result({"ok": False, "error": str(exc), "tool_name": definition.name}, is_error=True)
+    return tool_result(payload)
+
+
 async def on_call_tool(
     ctx: ServerRequestContext[Any, Any],
     params: types.CallToolRequestParams,
@@ -658,30 +977,16 @@ async def on_call_tool(
             await refresh_state(force=True)
         return tool_result(discovery_status_payload(auth_context))
 
-    state = await refresh_state()
-    definition = state.operations.get(params.name)
-    if definition is None:
-        raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {params.name}")
+    await refresh_state()
 
-    if not auth_context.auth_header:
-        return tool_result(
-            {
-                "ok": False,
-                "error": (
-                    "Missing request credentials for this tool call. Configure MCP HTTP headers "
-                    "`X-Nextcloud-Username` and `X-Nextcloud-AppToken`. "
-                    "Server discovery credentials are not used for tool execution over HTTP."
-                ),
-                "tool_name": params.name,
-            },
-            is_error=True,
-        )
+    if params.name == FIND_TOOL_NAME:
+        return find_result(arguments)
+    if params.name == DESCRIBE_TOOL_NAME:
+        return describe_result(arguments)
+    if params.name == CALL_TOOL_NAME:
+        return await call_result(arguments, auth_context)
 
-    try:
-        payload = await execute_operation(definition, arguments, auth_context)
-    except ValueError as exc:
-        return tool_result({"ok": False, "error": str(exc), "tool_name": params.name}, is_error=True)
-    return tool_result(payload)
+    raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {params.name}")
 
 
 @contextlib.asynccontextmanager

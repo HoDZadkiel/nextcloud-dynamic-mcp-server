@@ -2,7 +2,9 @@
 
 Exposes a live Nextcloud instance as an MCP server, reflecting whatever apps that instance actually has installed.
 
-Instead of shipping a fixed tool list, this server queries the Nextcloud `ocs_api_viewer` app at startup, reads the OpenAPI description of each installed app, and turns those operations into MCP tools dynamically. Point it at a Nextcloud with 28 apps enabled and you get the ~544 tools those apps expose - no per-app integration code.
+Instead of shipping a fixed tool list, this server queries the Nextcloud `ocs_api_viewer` app at startup, reads the OpenAPI description of each installed app, and turns those operations into a searchable catalogue. Point it at a Nextcloud with 28 apps enabled and all ~545 operations those apps expose become callable - no per-app integration code.
+
+The catalogue is published as four fixed tools rather than one tool per operation, so a client spends about 750 tokens of context on this server instead of ~101,000.
 
 Speaks MCP protocol revision `2026-07-28` (the stateless core) and still answers the older handshake revisions for clients that have not migrated.
 
@@ -22,12 +24,12 @@ See [What This Fork Changes](#what-this-fork-changes) for the delta.
 
 - Connects to the Nextcloud instance defined by `NEXTCLOUD_URL`
 - Reads installed app APIs from `NEXTCLOUD_URL/apps/ocs_api_viewer`
-- Builds MCP tools dynamically from the discovered OpenAPI operations
-- Proxies tool calls back to the real Nextcloud REST endpoints
+- Builds a searchable operation catalogue from the discovered OpenAPI documents
+- Proxies calls back to the real Nextcloud REST endpoints
 - Uses server-side credentials for discovery and per-caller credentials for execution
 - Supports both `streamable-http` and `stdio` transports
 
-Dynamic tools are named from the Nextcloud app id plus the OpenAPI operation id:
+Operations are named from the Nextcloud app id plus the OpenAPI operation id:
 
 ```text
 files_sharing_get_shares
@@ -35,9 +37,24 @@ provisioning_api_create_user
 dav_upcoming_events_get_events
 ```
 
-One built-in tool is always present:
+## Tools
 
-- **`nextcloud_discovery_status`** - the connected instance, auth mode, discovered apps, tool count, and last refresh/error state. Pass `{"refresh": true}` to re-run discovery first.
+The server publishes four tools, whatever the connected instance has installed:
+
+- **`nextcloud_find_operations`** - search the catalogue by free text and/or app id. Returns each match's name, HTTP method, path and summary. Its own description carries the app index (`collectives:84, spreed:142, ...`) so a client knows what exists before searching.
+- **`nextcloud_describe_operations`** - the full JSON Schema for one or more operations, so their arguments can be filled in. Takes a list, so a whole task's operations can be fetched in one call.
+- **`nextcloud_call_operation`** - execute one operation by name with an `arguments` object.
+- **`nextcloud_discovery_status`** - connected instance, auth mode, discovered apps, operation count, and last refresh/error state. Pass `{"refresh": true}` to re-run discovery first.
+
+A typical first use is `find` → `describe` → `call`. An unknown or near-miss operation name comes back with a `did_you_mean` list rather than an error, so a wrong guess costs one round trip instead of a failed task.
+
+### Why Not One Tool Per Operation
+
+An instance with every app enabled discovers ~545 operations. Publishing those as ~545 MCP tools puts their full input schemas into the context of every client on every session - measured against a live instance, 403,875 characters, roughly **101,000 tokens**, before a single call is made. No session uses more than a handful of them.
+
+The four-tool surface costs **~750 tokens**, a 99.3% reduction, and a realistic `find` + `describe` round trip adds ~310 tokens. Ten operations looked up on demand still cost an order of magnitude less than the old tool list.
+
+The trade is one extra round trip before an unfamiliar operation, and no client-side schema validation on `nextcloud_call_operation` - the `arguments` object is passed through as given, so `describe` is what keeps a call well-formed.
 
 ## Quick Start
 
@@ -114,7 +131,7 @@ At startup the server:
 
 1. Calls `GET /apps/ocs_api_viewer/apps`
 2. Loads each app's OpenAPI document from `GET /apps/ocs_api_viewer/apps/{appId}`
-3. Builds an MCP input schema from each operation's parameters and request body
+3. Builds an MCP input schema from each operation's parameters and request body, inlining any `$ref` against that document's `components` so the schema is self-contained
 4. Registers the operation as a callable MCP tool
 
 Apps whose OpenAPI document fails to load are skipped with a warning; the rest still register.
@@ -170,7 +187,7 @@ curl http://localhost:8000/
 docker compose logs -f mcp
 ```
 
-Then call `nextcloud_discovery_status` from your MCP client and confirm the tool list includes operations from your enabled apps.
+Then call `nextcloud_discovery_status` from your MCP client and confirm the app inventory matches your enabled apps, and `nextcloud_find_operations` with a term like `share` to confirm the catalogue is populated.
 
 ## Tests
 
@@ -182,9 +199,9 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Covers schema generation, credential handling, discovery retry, and the `2026-07-28` protocol surface (`server/discover`, cache hints, per-request auth) against the in-process ASGI app.
+Covers schema generation (including `$ref` inlining), credential handling, discovery retry, catalogue search and description, and the `2026-07-28` protocol surface (`server/discover`, cache hints, per-request auth) against the in-process ASGI app.
 
-**Not covered:** proxying against a real Nextcloud instance, and any write-path operation. The tool catalogue includes a large number of `POST`/`PUT`/`DELETE` operations that have not been exercised - validate those against a test instance before relying on them.
+**Not covered:** proxying against a real Nextcloud instance, and any write-path operation. The catalogue includes a large number of `POST`/`PUT`/`DELETE` operations that have not been exercised - validate those against a test instance before relying on them.
 
 ## What This Fork Changes
 
@@ -204,12 +221,24 @@ The upstream targets the pre-2.0 SDK and the stateful handshake protocol. This f
 
 Older handshake-protocol clients still work; the transport routes by the `MCP-Protocol-Version` header.
 
+### Catalogue replaces the per-operation tool list
+
+Upstream registers one MCP tool per discovered operation. On a fully-loaded instance that is ~545 tools and ~101,000 tokens of `inputSchema` in every client's context, permanently, for a handful of actual calls. Roughly a third of it was not even schema: `dynamic_tool_description` prefixed every tool with the same two fixed sentences, ~98,000 characters of identical text across the list.
+
+This fork publishes four tools instead - `find` / `describe` / `call` plus the status tool - and searches the catalogue on demand. Measured against the same instance: ~750 tokens, 99.3% less. See [Why Not One Tool Per Operation](#why-not-one-tool-per-operation).
+
+**Breaking:** operation names are unchanged, but they are no longer MCP tool names. A client that called `collectives_page_create` directly now calls `nextcloud_call_operation` with `{"name": "collectives_page_create", "arguments": {...}}`, and per-tool permission allowlists need rewriting against the four tool names.
+
 ### Security fixes
 
 - **Session token leak.** Proxied responses returned `dict(response.headers)`, which includes the `Set-Cookie` session passphrase Nextcloud issues on every Basic-auth request - putting a live session token into the MCP conversation. Now filtered to a safe allowlist.
 - **Auth header override.** An OpenAPI header parameter named `Authorization` became a tool argument that overwrote the caller's credentials. Now filtered alongside `OCS-APIRequest`.
 - **Open CORS.** `allow_origins` was pinned to `["*"]`. Now driven by `CORS_ALLOW_ORIGINS`, closed by default.
 - **Health endpoint disclosure.** `GET /` returned the internal Nextcloud URL, the API-viewer URL, the installed-app inventory, and raw discovery error text to any origin. Trimmed to non-sensitive fields.
+
+### Compatibility fixes
+
+- **Dangling `$ref` broke strict MCP clients.** Nextcloud's OpenAPI documents use `$ref: "#/components/schemas/X"` for recursive or reused fields (e.g. `files_template_create`'s `templateFields`, `spreed_room_create_room`'s `participants`, `tables_api_tables_create_from_scheme`'s `columns`/`views`). The old code copied these `$ref` pointers verbatim into each tool's `inputSchema`, but an MCP client only ever receives that one tool's schema - never the surrounding `components` section - so the pointer resolved to nothing. Claude Code tolerates unresolvable `$ref`s; opencode does not and fails to build a parser for the whole tool list. `build_input_schema` now inlines every `$ref` against the source document before publishing the schema, with cycle/depth guards (`MAX_REF_DEPTH`) in case a future Nextcloud release introduces a self-referential schema. This is generic JSON-Pointer resolution, not special-cased per app or operation - any `$ref` Nextcloud's OpenAPI output produces, now or after an upstream API change, is handled the same way.
 
 ### Reliability fixes
 
@@ -219,6 +248,6 @@ Older handshake-protocol clients still work; the transport routes by the `MCP-Pr
 
 ### Added
 
-- `test_main.py` - 18 tests
+- `test_main.py` - 31 tests
 - `.gitignore`, `requirements-dev.txt`
 - `DEVLOG.md` - change log and open items
