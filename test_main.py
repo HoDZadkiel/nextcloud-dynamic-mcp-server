@@ -20,6 +20,8 @@ META_TOOL_NAMES = [
     main.FIND_TOOL_NAME,
     main.DESCRIBE_TOOL_NAME,
     main.CALL_TOOL_NAME,
+    main.READ_FILE_TOOL_NAME,
+    main.WRITE_FILE_TOOL_NAME,
 ]
 
 AUTH_HEADERS = {
@@ -793,6 +795,185 @@ def test_status_refresh_requires_credentials():
     # Discovery would have failed against the unreachable test URL and wiped the
     # catalogue; it surviving proves the refresh never ran.
     assert len(main.DISCOVERY_STATE.operations) == 1
+
+
+# --- WebDAV file access ------------------------------------------------------
+#
+# ocs_api_viewer describes the OCS API only, so no discovered operation can
+# return a file's bytes - collectives_page_get reports a page's size but never
+# its body. These two tools are hand-written to cover that gap.
+
+
+def webdav_auth(username="alice"):
+    return main.AuthContext(
+        auth_header="Basic YWxpY2U6dA==", source="request_basic_headers",
+        cache_key="request:x", username=username,
+    )
+
+
+class FakeResponse:
+    def __init__(self, status_code=200, headers=None, body=b""):
+        self.status_code = status_code
+        self.headers = httpx2.Headers(headers or {})
+        self.content = body
+
+    @property
+    def is_success(self):
+        return 200 <= self.status_code < 300
+
+    @property
+    def text(self):
+        return self.content.decode("utf-8")
+
+    def json(self):
+        import json
+
+        return json.loads(self.text)
+
+
+class FakeClient:
+    def __init__(self, response, record):
+        self._response, self._record = response, record
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return False
+
+    async def get(self, url, headers=None):
+        self._record.update(method="GET", url=url, headers=headers)
+        return self._response
+
+    async def put(self, url, headers=None, content=None):
+        self._record.update(method="PUT", url=url, headers=headers, content=content)
+        return self._response
+
+
+def run_webdav(coro_factory, response):
+    """Swap httpx2.AsyncClient for a recorder so the WebDAV request that would
+    have gone out can be asserted on."""
+    record = {}
+    original = main.httpx2.AsyncClient
+    main.httpx2.AsyncClient = lambda **_: FakeClient(response, record)
+    try:
+        return asyncio.run(coro_factory()), record
+    finally:
+        main.httpx2.AsyncClient = original
+
+
+def test_header_auth_context_keeps_the_username_for_webdav():
+    """The username arrives on every request but used to be dropped once it had
+    been folded into the Basic header; WebDAV paths need it back."""
+    ctx = type("Ctx", (), {"request": FakeRequest(
+        {"x-nextcloud-username": "alice", "x-nextcloud-apptoken": "alice-token"}
+    )})()
+
+    assert main.execution_auth_context(ctx).username == "alice"
+
+
+def test_webdav_url_encodes_spaces_and_non_ascii_per_segment():
+    """Real paths here carry CJK names and spaces; separators must
+    stay literal while the names around them are encoded."""
+    url = main.webdav_url(webdav_auth(), ".Collectives/知識庫/第一章 概論/notes.md")
+
+    assert url.startswith(f"{main.NEXTCLOUD_URL}/remote.php/dav/files/alice/")
+    assert url.endswith("/.Collectives/%E7%9F%A5%E8%AD%98%E5%BA%AB/%E7%AC%AC%E4%B8%80%E7%AB%A0%20%E6%A6%82%E8%AB%96/notes.md")
+
+
+def test_webdav_url_rejects_traversal():
+    """Basic auth already confines the caller to their own files, but `..` could
+    still climb out of the files root and address other DAV endpoints."""
+    for path in ("../evil", ".Collectives/../../x", "a/./b"):
+        try:
+            main.webdav_url(webdav_auth(), path)
+        except ValueError:
+            continue
+        raise AssertionError(f"traversal not rejected: {path}")
+
+
+def test_webdav_url_requires_a_username():
+    try:
+        main.webdav_url(main.AuthContext(auth_header="Basic x", source="s", cache_key="c"), "a.md")
+    except ValueError as exc:
+        assert "username" in str(exc)
+    else:
+        raise AssertionError("missing username was not rejected")
+
+
+def test_read_file_returns_content_and_etag():
+    response = FakeResponse(
+        headers={"content-type": "text/markdown; charset=utf-8", "etag": '"abc123"'},
+        body="# 標題\n內文".encode("utf-8"),
+    )
+
+    payload, record = run_webdav(
+        lambda: main.read_file(webdav_auth(), ".Collectives/kb/page.md"), response
+    )
+
+    assert record["method"] == "GET"
+    assert payload["ok"] is True
+    assert payload["data"] == "# 標題\n內文"
+    assert payload["etag"] == '"abc123"'
+
+
+def test_read_file_base64_encodes_binary():
+    response = FakeResponse(headers={"content-type": "image/png"}, body=b"\x89PNG\r\n")
+
+    payload, _ = run_webdav(lambda: main.read_file(webdav_auth(), "photo.png"), response)
+
+    assert payload["data_base64"] == "iVBORw0K"
+    assert "data" not in payload
+
+
+def test_write_file_sends_utf8_bytes_and_if_match():
+    response = FakeResponse(status_code=204, headers={"etag": '"new"'})
+
+    payload, record = run_webdav(
+        lambda: main.write_file(webdav_auth(), "kb/page.md", "新內容", if_match='"old"'),
+        response,
+    )
+
+    assert record["method"] == "PUT"
+    assert record["content"] == "新內容".encode("utf-8")
+    assert record["headers"]["If-Match"] == '"old"'
+    assert payload["ok"] is True and payload["etag"] == '"new"'
+
+
+def test_write_file_omits_if_match_when_not_given():
+    response = FakeResponse(status_code=201)
+
+    _, record = run_webdav(lambda: main.write_file(webdav_auth(), "kb/page.md", "x"), response)
+
+    assert "If-Match" not in record["headers"]
+
+
+def test_write_file_explains_a_precondition_failure():
+    """A bare 412 tells the caller nothing about how to recover, and the wrong
+    recovery here is re-writing stale content over somebody's edit."""
+    response = FakeResponse(status_code=412)
+
+    payload, _ = run_webdav(
+        lambda: main.write_file(webdav_auth(), "kb/page.md", "x", if_match='"stale"'), response
+    )
+
+    assert payload["ok"] is False
+    assert "Read it again" in payload["error"]
+
+
+def test_file_tools_require_caller_credentials():
+    for tool in (main.READ_FILE_TOOL_NAME, main.WRITE_FILE_TOOL_NAME):
+        result = run_mcp(
+            lambda client, tool=tool: post_mcp(
+                client,
+                "tools/call",
+                {"name": tool, "arguments": {"path": "kb/page.md", "content": "x"}},
+                call_headers(tool, authenticated=False),
+            )
+        )["result"]["structuredContent"]
+
+        assert result["ok"] is False, tool
+        assert "Missing request credentials" in result["error"], tool
 
 
 def test_healthcheck_does_not_leak_the_nextcloud_url():

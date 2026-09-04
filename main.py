@@ -53,6 +53,11 @@ STATUS_TOOL_NAME = "nextcloud_discovery_status"
 FIND_TOOL_NAME = "nextcloud_find_operations"
 DESCRIBE_TOOL_NAME = "nextcloud_describe_operations"
 CALL_TOOL_NAME = "nextcloud_call_operation"
+READ_FILE_TOOL_NAME = "nextcloud_read_file"
+WRITE_FILE_TOOL_NAME = "nextcloud_write_file"
+# Files live outside the OCS API that ocs_api_viewer describes, so these two
+# tools are hand-written rather than discovered. See `WebDAV` in the README.
+WEBDAV_ROOT = "/remote.php/dav/files"
 FIND_DEFAULT_LIMIT = 30
 FIND_MAX_LIMIT = 200
 SUGGESTION_LIMIT = 5
@@ -103,6 +108,9 @@ class AuthContext:
     auth_header: str | None
     source: str
     cache_key: str
+    # WebDAV addresses a user's files as /remote.php/dav/files/<username>/...,
+    # so the caller's own username has to survive alongside the encoded header.
+    username: str | None = None
 
 
 DISCOVERY_STATE = DiscoveryState()
@@ -383,6 +391,7 @@ def default_auth_context() -> AuthContext:
             auth_header=auth_header,
             source="env_basic",
             cache_key=f"env:{hash_auth_value(auth_header)}",
+            username=NEXTCLOUD_USERNAME,
         )
     return AuthContext(auth_header=None, source="none", cache_key="anonymous")
 
@@ -396,6 +405,7 @@ def header_auth_context(headers: Any) -> AuthContext:
             auth_header=auth_header,
             source="request_basic_headers",
             cache_key=f"request:{hash_auth_value(auth_header)}",
+            username=username,
         )
     return AuthContext(auth_header=None, source="none", cache_key="anonymous")
 
@@ -795,6 +805,67 @@ def list_tools(authenticated: bool = False) -> list[types.Tool]:
                 "additionalProperties": False,
             },
         ),
+        types.Tool(
+            name=READ_FILE_TOOL_NAME,
+            description=(
+                "Read a file from the caller's Nextcloud files over WebDAV, and return "
+                "its contents plus an ETag. Use this for anything the OCS API only "
+                "describes rather than serves - notably the body of a Collectives page, "
+                "which the collectives operations report metadata for but never return. "
+                "Compose a page's path from its own index entry: "
+                "`{collectivePath}/{filePath}/{fileName}`, dropping `filePath` when it "
+                "is empty - e.g. `.Collectives/Handbook/SAM/notes.md`. "
+                "Binary files come back base64-encoded in `data_base64`."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Path relative to the caller's files root, without a leading "
+                            "slash. `.` and `..` segments are rejected."
+                        ),
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        ),
+        types.Tool(
+            name=WRITE_FILE_TOOL_NAME,
+            description=(
+                f"Replace a file's contents over WebDAV, writing UTF-8 text. This "
+                f"overwrites the whole file, so read it with `{READ_FILE_TOOL_NAME}` "
+                f"first and send back the `etag` you got as `if_match` - the write then "
+                f"fails with 412 instead of discarding an edit somebody made in between. "
+                f"The parent folder must already exist: to add a Collectives page, create "
+                f"it with `collectives_page_create` through `{CALL_TOOL_NAME}` and write "
+                f"its body here."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Path relative to the caller's files root.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "The complete new contents of the file.",
+                    },
+                    "if_match": {
+                        "type": "string",
+                        "description": (
+                            f"ETag from a prior `{READ_FILE_TOOL_NAME}`. Omit only when "
+                            f"deliberately overwriting whatever is there."
+                        ),
+                    },
+                },
+                "required": ["path", "content"],
+                "additionalProperties": False,
+            },
+        ),
     ]
 
 
@@ -895,6 +966,107 @@ async def execute_operation(
         "response_headers": safe_response_headers(response.headers),
     }
     payload.update(parse_response_body(response))
+    return payload
+
+
+def webdav_url(auth_context: AuthContext, path: str) -> str:
+    """Resolve a user-relative path to its WebDAV URL.
+
+    `.` and `..` are rejected rather than normalised: the caller is already
+    confined to their own files by Basic auth, but a traversal could still climb
+    out of `/remote.php/dav/files/<user>/` and address other DAV endpoints.
+    Each segment is encoded separately so that spaces and non-ASCII names -
+    `.Collectives/研究筆記/第一章 概論/…` is an ordinary shape here - survive intact
+    the separators stay literal.
+    """
+    if not auth_context.username:
+        raise ValueError("Cannot resolve a WebDAV path without the caller's username")
+
+    segments = [segment for segment in str(path or "").replace("\\", "/").split("/") if segment]
+    if not segments:
+        raise ValueError("Path is required")
+    for segment in segments:
+        if segment in (".", ".."):
+            raise ValueError(f"Path segment not allowed: {segment}")
+
+    encoded = "/".join(quote(segment, safe="") for segment in segments)
+    return f"{NEXTCLOUD_URL}{WEBDAV_ROOT}/{quote(auth_context.username, safe='')}/{encoded}"
+
+
+def build_webdav_headers(
+    auth_context: AuthContext,
+    extra_headers: dict[str, str] | None = None,
+) -> dict[str, str]:
+    headers = {"Accept": "*/*"}
+    if auth_context.auth_header:
+        headers["Authorization"] = auth_context.auth_header
+    if extra_headers:
+        headers.update(extra_headers)
+    return headers
+
+
+async def read_file(auth_context: AuthContext, path: str) -> dict[str, Any]:
+    url = webdav_url(auth_context, path)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.get(url, headers=build_webdav_headers(auth_context))
+
+    payload = {
+        "ok": response.is_success,
+        "status_code": response.status_code,
+        "path": path,
+        # Carry the ETag out so it can be handed straight back as `if_match`.
+        "etag": response.headers.get("etag"),
+        "response_headers": safe_response_headers(response.headers),
+    }
+    payload.update(parse_response_body(response))
+    return payload
+
+
+async def write_file(
+    auth_context: AuthContext,
+    path: str,
+    content: str,
+    if_match: str | None = None,
+) -> dict[str, Any]:
+    """Replace a file's contents.
+
+    `if_match` is the ETag a prior read returned. Sending it makes the write
+    conditional, so an edit computed from stale content fails with 412 instead
+    of silently discarding whatever changed in between - the difference between
+    a lost paragraph and a retry.
+    """
+    url = webdav_url(auth_context, path)
+    extra_headers = {"If-Match": if_match} if if_match else None
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.put(
+            url,
+            headers=build_webdav_headers(auth_context, extra_headers),
+            content=str(content).encode("utf-8"),
+        )
+
+    payload: dict[str, Any] = {
+        "ok": response.is_success,
+        "status_code": response.status_code,
+        "path": path,
+        "etag": response.headers.get("etag"),
+        "response_headers": safe_response_headers(response.headers),
+    }
+    if response.status_code == 412:
+        payload["error"] = (
+            "The file changed since the `if_match` ETag was read. Read it again, "
+            "reapply the edit to the current content, and retry."
+        )
+    elif response.status_code == 409:
+        payload["error"] = (
+            "The parent folder does not exist. WebDAV does not create it; make the "
+            "page or folder through its own API first, then write the content."
+        )
+    elif not response.is_success:
+        payload.update(parse_response_body(response))
     return payload
 
 
@@ -1020,6 +1192,31 @@ async def call_result(
     return tool_result(payload)
 
 
+async def file_result(
+    tool_name: str,
+    arguments: dict[str, Any],
+    auth_context: AuthContext,
+) -> types.CallToolResult:
+    if not auth_context.auth_header:
+        return missing_credentials_result(tool_name)
+
+    try:
+        if tool_name == READ_FILE_TOOL_NAME:
+            payload = await read_file(auth_context, arguments.get("path"))
+        else:
+            payload = await write_file(
+                auth_context,
+                arguments.get("path"),
+                arguments.get("content", ""),
+                arguments.get("if_match"),
+            )
+    except ValueError as exc:
+        return tool_result({"ok": False, "error": str(exc), "tool_name": tool_name}, is_error=True)
+
+    payload["tool_name"] = tool_name
+    return tool_result(payload, is_error=not payload["ok"])
+
+
 async def on_call_tool(
     ctx: ServerRequestContext[Any, Any],
     params: types.CallToolRequestParams,
@@ -1045,6 +1242,8 @@ async def on_call_tool(
         return describe_result(arguments, auth_context)
     if params.name == CALL_TOOL_NAME:
         return await call_result(arguments, auth_context)
+    if params.name in (READ_FILE_TOOL_NAME, WRITE_FILE_TOOL_NAME):
+        return await file_result(params.name, arguments, auth_context)
 
     raise MCPError(types.INVALID_PARAMS, f"Unknown tool: {params.name}")
 
