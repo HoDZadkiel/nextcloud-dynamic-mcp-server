@@ -76,6 +76,22 @@ Three behaviours here were corrected only after testing against a real instance 
 - `GET` on a folder returns **200** with the HTML placeholder Nextcloud serves for a collection, which made a mistyped path look like a successfully read file. Files always carry an ETag and that page never does, which is how the two are told apart.
 - ETags come back with a `-gzip` (or `-br`, `-deflate`, `-zstd`) suffix whenever the response is compressed, while the entity's real validator has none. Handing the suffixed value back as `If-Match` failed with 412 while nothing had changed, and re-reading returned the same suffixed value - an unbreakable loop. It only bites on responses large enough to compress, so small test files never showed it.
 
+### Calendar
+
+Eight `caldav_*` operations close the same gap for calendars that WebDAV closes for files. Nextcloud's calendar app is CalDAV ([RFC 4791](https://www.rfc-editor.org/rfc/rfc4791)) end to end - there is no OCS REST API for it, so `ocs_api_viewer` has nothing to discover here. `dav_upcoming_events_get_events`, the one calendar-adjacent operation that *is* discovered, only powers the dashboard widget's next few events and offers no create/update/delete path.
+
+They cover calendars (`caldav_list_calendars`, `caldav_create_calendar`, `caldav_delete_calendar`) and events (`caldav_list_events`, `caldav_get_event`, `caldav_create_event`, `caldav_update_event`, `caldav_delete_event`). Only `VEVENT` (ordinary calendar events) is handled - `VTODO` and `VJOURNAL` entries are neither returned nor created.
+
+Event identity follows the same rule [sabre/dav](https://sabre.io/dav/building-a-caldav-client/) - the CalDAV library Nextcloud's server is built on - documents for its own clients: a calendar object's filename is not guaranteed to match its `UID`. Every operation that addresses one event therefore takes the `path` a prior `caldav_list_events`, `caldav_get_event` or `caldav_create_event` already returned, never one composed by hand - the same pattern `webdav_*` uses for file paths.
+
+`caldav_update_event` is a full replace, like `webdav_write_file`: read the event with `caldav_get_event` first, apply the change to what it returned, and send everything back - fields left out are cleared, not preserved. Pass the `etag` back as `if_match` and a write computed from a stale read fails with 412 instead of discarding a concurrent edit, the same guard `webdav_write_file` uses.
+
+`caldav_list_events` defaults to a 90-day window from now (`time_min`/`time_max` override it, `all_time` lifts it) because a CalDAV `REPORT` has no pagination - an unbounded query against a calendar with years of recurring events could return all of it. A recurring event is returned once, as its master; `override_count` says how many dated exceptions exist without expanding them, and `rrule` is passed through as a raw RFC 5545 value rather than translated from natural language.
+
+Times need a UTC offset or `Z` - `2026-09-20T14:00:00+08:00`, not a bare local datetime - because CalDAV has no notion of which timezone the caller means. Reading back a time the server tagged with an IANA zone (`TZID=Asia/Taipei`) returns the wall-clock value plus that zone name rather than converting it to an absolute instant; this server does not parse `VTIMEZONE` tables, so treat a returned event's `timezone` field as informational.
+
+**Not verified against a live instance.** Unlike WebDAV - which surfaced three real quirks only visible against a running Nextcloud (see above) - the CalDAV operations were built from RFC 4791/5545 and sabre/dav's own documentation, and exercised only against synthetic fixtures in `test_main.py`. Validate against a real calendar before relying on them, especially `caldav_create_calendar`'s `color` property (an Apple/CalendarServer extension, not part of RFC 4791, that most servers including Nextcloud accept but nothing guarantees) and calendar deletion, which is treated as permanent here because this server has not confirmed whether Nextcloud's calendar trash retention actually catches it.
+
 ### Why Not One Tool Per Operation
 
 An instance with every app enabled discovers ~545 operations. Publishing those as ~545 MCP tools puts their full input schemas into the context of every client on every session - measured against a live instance, 403,875 characters, roughly **101,000 tokens**, before a single call is made. No session uses more than a handful of them.
@@ -231,9 +247,9 @@ pip install -r requirements-dev.txt
 pytest
 ```
 
-Covers schema generation (including `$ref` inlining), credential handling, discovery retry, catalogue search and description, and the `2026-07-28` protocol surface (`server/discover`, cache hints, per-request auth) against the in-process ASGI app.
+Covers schema generation (including `$ref` inlining), credential handling, discovery retry, catalogue search and description, the `2026-07-28` protocol surface (`server/discover`, cache hints, per-request auth), the WebDAV file operations, and the CalDAV calendar/event operations (iCalendar escaping/folding round trips, PROPFIND/REPORT XML parsing against fixtures, ETag/`If-Match` handling) against the in-process ASGI app.
 
-**Not covered:** proxying against a real Nextcloud instance, and any write-path operation. The catalogue includes a large number of `POST`/`PUT`/`DELETE` operations that have not been exercised - validate those against a test instance before relying on them.
+**Not covered:** proxying against a real Nextcloud instance, and any write-path operation. The catalogue includes a large number of `POST`/`PUT`/`DELETE` operations that have not been exercised - validate those against a test instance before relying on them. The CalDAV operations specifically have not been run against a live Nextcloud calendar at all; see [Calendar](#calendar).
 
 ## What This Fork Changes
 
@@ -267,6 +283,10 @@ This fork publishes four instead - `find` / `describe` / `call` plus the status 
 
 Added five WebDAV operations - read, write, list, create folder, delete - speaking with the caller's own credentials. They are generic file access rather than Collectives-aware, so the server keeps its defining property of having no per-app integration code. Several of their behaviours were corrected only after testing against a real instance; see [WebDAV](#webdav).
 
+### Calendar access, which discovery cannot reach either
+
+Calendars are CalDAV, not an OCS REST API, so upstream cannot list a calendar, read an event, or create/update/delete one - the one discovered calendar-adjacent operation only feeds the dashboard's upcoming-events widget. Added eight `caldav_*` operations - list/create/delete calendars, list/get/create/update/delete events - speaking with the caller's own credentials, following RFC 4791/5545. See [Calendar](#calendar) for what they cover and what has not been verified against a live instance.
+
 ### Security fixes
 
 - **Session token leak.** Proxied responses returned `dict(response.headers)`, which includes the `Set-Cookie` session passphrase Nextcloud issues on every Basic-auth request - putting a live session token into the MCP conversation. Now filtered to a safe allowlist.
@@ -287,6 +307,6 @@ Added five WebDAV operations - read, write, list, create folder, delete - speaki
 
 ### Added
 
-- `test_main.py` - 68 tests
+- `test_main.py` - 107 tests
 - `.gitignore`, `requirements-dev.txt`
 - `DEVLOG.md` - change log and open items

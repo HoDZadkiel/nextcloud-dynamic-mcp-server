@@ -6,9 +6,11 @@ import hashlib
 import json
 import logging
 import os
+import re
 import time
+import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, unquote
 from xml.etree import ElementTree
@@ -58,6 +60,19 @@ WEBDAV_APP_ID = "webdav"
 # Files live outside the OCS API that ocs_api_viewer describes, so the webdav_*
 # operations are hand-written rather than discovered. See `WebDAV` in the README.
 WEBDAV_ROOT = "/remote.php/dav/files"
+CALDAV_APP_ID = "caldav"
+# Calendars are CalDAV (RFC 4791), not an OCS REST API, so ocs_api_viewer never
+# sees them either - the caldav_* operations are hand-written for the same
+# reason webdav_* is. See `Calendar` in the README.
+CALDAV_ROOT = "/remote.php/dav/calendars"
+DAV_NS = "{DAV:}"
+CALDAV_NS = "{urn:ietf:params:xml:ns:caldav}"
+CALENDARSERVER_NS = "{http://calendarserver.org/ns/}"
+APPLE_ICAL_NS = "{http://apple.com/ns/ical/}"
+ICAL_NEWLINE = "\r\n"
+DEFAULT_EVENT_WINDOW_DAYS = 90
+EVENT_LIST_DEFAULT_LIMIT = 100
+EVENT_LIST_MAX_LIMIT = 500
 ETAG_ENCODING_SUFFIXES = ("-gzip", "-br", "-deflate", "-zstd")
 # Only the properties the tools actually report; asking for allprop would drag
 # in Nextcloud's whole custom property set for no gain.
@@ -546,8 +561,8 @@ def current_state() -> DiscoveryState:
 
 def all_operations() -> dict[str, OperationDefinition]:
     """The catalogue as callers see it: what discovery found, plus the
-    hand-written WebDAV entries. Built-ins are merged at read time rather than
-    written into DiscoveryState, so a refresh cannot drop them."""
+    hand-written WebDAV and CalDAV entries. Built-ins are merged at read time
+    rather than written into DiscoveryState, so a refresh cannot drop them."""
     return {**BUILTIN_OPERATIONS, **current_state().operations}
 
 
@@ -689,9 +704,13 @@ def suggest_operation_names(name: Any) -> list[str]:
 
 
 def app_index() -> str:
-    """Includes the built-in `webdav` app, which is not discovered and would
-    otherwise be invisible to anyone who did not already know it was there."""
-    entries = [f"{WEBDAV_APP_ID}:{len(BUILTIN_OPERATIONS)}"]
+    """Includes the built-in `webdav` and `caldav` apps, which are not discovered
+    and would otherwise be invisible to anyone who did not already know they
+    were there."""
+    builtin_counts: dict[str, int] = {}
+    for definition in BUILTIN_OPERATIONS.values():
+        builtin_counts[definition.app_id] = builtin_counts.get(definition.app_id, 0) + 1
+    entries = [f"{app_id}:{count}" for app_id, count in sorted(builtin_counts.items())]
     entries += [f"{app['id']}:{app['operation_count']}" for app in current_state().apps]
     return ", ".join(entries)
 
@@ -1316,6 +1335,812 @@ WEBDAV_HANDLERS = {
 PATH_PROPERTY = {"type": "string", "description": "Path relative to the caller's files root."}
 
 
+# --- CalDAV (calendars) -------------------------------------------------------
+#
+# Same rationale as WebDAV above: calendars are CalDAV (RFC 4791), which lives
+# outside anything ocs_api_viewer's OpenAPI documents describe, so listing
+# calendars, reading events and writing them all have to be hand-written. Only
+# VEVENT (ordinary calendar events) is covered - VTODO and VJOURNAL are not.
+#
+# Event identity: a calendar object's filename is not guaranteed to match its
+# UID (sabre/dav, the library Nextcloud's CalDAV server is built on, says so
+# explicitly), so every operation that addresses a specific event takes the
+# `path` a prior list/get/create already returned rather than one composed
+# from a UID by hand - the same pattern `webdav_*` uses for file paths.
+
+
+def ical_escape_text(value: str) -> str:
+    """RFC 5545 §3.3.11 TEXT escaping. Order matters: backslashes first, or a
+    backslash introduced by a later replacement would get escaped again."""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace("\n", "\\n")
+        .replace("\r", "")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+    )
+
+
+def ical_unescape_text(value: str) -> str:
+    return re.sub(r"\\(.)", lambda match: "\n" if match.group(1) in "nN" else match.group(1), value)
+
+
+def fold_ical_line(line: str) -> str:
+    """RFC 5545 §3.1: a content line over 75 octets is folded into CRLF plus a
+    leading space per continuation, without splitting a multi-byte UTF-8
+    sequence across the break."""
+    data = line.encode("utf-8")
+    if len(data) <= 75:
+        return line
+
+    def safe_end(start: int, limit: int) -> int:
+        end = min(start + limit, len(data))
+        while end < len(data) and (data[end] & 0xC0) == 0x80:
+            end -= 1
+        return end
+
+    end = safe_end(0, 75)
+    parts = [data[0:end].decode("utf-8")]
+    pos = end
+    while pos < len(data):
+        end = safe_end(pos, 74)  # 74 + the leading continuation space = 75
+        parts.append(" " + data[pos:end].decode("utf-8"))
+        pos = end
+    return ICAL_NEWLINE.join(parts)
+
+
+def unfold_ical_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.replace("\r\n", "\n").split("\n"):
+        if raw.startswith(" ") or raw.startswith("\t"):
+            if lines:
+                lines[-1] += raw[1:]
+            continue
+        if raw:
+            lines.append(raw)
+    return lines
+
+
+def parse_ical_property(line: str) -> tuple[str, dict[str, str], str]:
+    if ":" not in line:
+        return line.upper(), {}, ""
+    head, value = line.split(":", 1)
+    parts = head.split(";")
+    params: dict[str, str] = {}
+    for part in parts[1:]:
+        key, _, val = part.partition("=")
+        if key:
+            params[key.upper()] = val.strip('"')
+    return parts[0].upper(), params, value
+
+
+def extract_blocks(lines: list[str], component: str) -> list[list[str]]:
+    """Pull out the inner lines of every top-level `BEGIN:{component}` ...
+    `END:{component}` block. Not recursive - VALARM never nests VALARM, and
+    VEVENT blocks are addressed one at a time, so one level is enough."""
+    blocks: list[list[str]] = []
+    current: list[str] | None = None
+    depth = 0
+    for line in lines:
+        name, _, value = line.partition(":")
+        bare_name = name.split(";")[0].upper()
+        if bare_name == "BEGIN" and value.strip().upper() == component:
+            if depth == 0:
+                current = []
+            depth += 1
+            continue
+        if bare_name == "END" and value.strip().upper() == component:
+            depth -= 1
+            if depth == 0 and current is not None:
+                blocks.append(current)
+                current = None
+            continue
+        if current is not None:
+            current.append(line)
+    return blocks
+
+
+def strip_blocks(lines: list[str], component: str) -> list[str]:
+    result: list[str] = []
+    depth = 0
+    for line in lines:
+        name, _, value = line.partition(":")
+        bare_name = name.split(";")[0].upper()
+        if bare_name == "BEGIN" and value.strip().upper() == component:
+            depth += 1
+            continue
+        if bare_name == "END" and value.strip().upper() == component:
+            depth -= 1
+            continue
+        if depth == 0:
+            result.append(line)
+    return result
+
+
+def encode_ical_datetime(value: Any, field: str) -> tuple[str, bool]:
+    """Returns (iCalendar value, is_date_only). A bare local datetime is
+    rejected rather than guessed at - CalDAV has no notion of the caller's
+    timezone, so there is no safe default to fall back to."""
+    text = str(value).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        return text.replace("-", ""), True
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(
+            f"`{field}` must be `YYYY-MM-DD` for an all-day event, or a full ISO-8601 "
+            f"datetime with a UTC offset or `Z` (e.g. `2026-09-20T14:00:00+08:00`): {exc}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"`{field}` needs a UTC offset or `Z` - a bare local datetime is ambiguous "
+            f"without knowing the calendar's timezone."
+        )
+    return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"), False
+
+
+def decode_ical_datetime(value: str, params: dict[str, str]) -> dict[str, Any] | None:
+    """The inverse of `encode_ical_datetime`, plus the cases a server can hand
+    back that a caller never sends: a `TZID`-qualified or floating local time,
+    which is returned as the naive wall-clock value plus the zone name rather
+    than converted to an absolute instant - that would need the event's
+    `VTIMEZONE` table, which this server does not parse."""
+    if not value:
+        return None
+    if params.get("VALUE", "").upper() == "DATE" or (len(value) == 8 and value.isdigit()):
+        return {"value": f"{value[0:4]}-{value[4:6]}-{value[6:8]}", "all_day": True, "timezone": None}
+    if value.endswith("Z"):
+        try:
+            parsed = datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            return {"value": value, "all_day": False, "timezone": None}
+        return {"value": parsed.isoformat(), "all_day": False, "timezone": "UTC"}
+    try:
+        parsed = datetime.strptime(value, "%Y%m%dT%H%M%S")
+    except ValueError:
+        return {"value": value, "all_day": False, "timezone": params.get("TZID")}
+    return {"value": parsed.isoformat(), "all_day": False, "timezone": params.get("TZID")}
+
+
+def parse_utc_ical_timestamp(value: str) -> str | None:
+    """CREATED/LAST-MODIFIED/DTSTAMP are always UTC per RFC 5545, unlike
+    DTSTART/DTEND - so these come back as a plain ISO string rather than the
+    `{value, all_day, timezone}` shape a possibly-floating time needs."""
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).isoformat()
+    except ValueError:
+        return value
+
+
+def parse_vevent_block(lines: list[str]) -> dict[str, Any]:
+    alarm_blocks = extract_blocks(lines, "VALARM")
+    own_lines = strip_blocks(lines, "VALARM")
+
+    props: dict[str, list[tuple[dict[str, str], str]]] = {}
+    for line in own_lines:
+        name, params, value = parse_ical_property(line)
+        props.setdefault(name, []).append((params, ical_unescape_text(value)))
+
+    def first(name: str, default: str = "") -> str:
+        return props[name][0][1] if name in props else default
+
+    def first_params(name: str) -> dict[str, str]:
+        return props[name][0][0] if name in props else {}
+
+    def mailto_entry(params: dict[str, str], value: str) -> dict[str, Any]:
+        email = value[7:] if value.lower().startswith("mailto:") else value
+        return {"email": email, "name": params.get("CN")}
+
+    organizer_entries = props.get("ORGANIZER", [])
+    reminders: list[dict[str, Any]] = []
+    for alarm_lines in alarm_blocks:
+        alarm_props: dict[str, str] = {}
+        for line in alarm_lines:
+            name, _, value = parse_ical_property(line)
+            alarm_props[name] = value
+        trigger = alarm_props.get("TRIGGER", "")
+        match = re.fullmatch(r"-PT(\d+)([HM])", trigger)
+        minutes_before = (int(match.group(1)) * (60 if match.group(2) == "H" else 1)) if match else None
+        reminders.append({"trigger": trigger or None, "minutes_before": minutes_before})
+
+    return {
+        "uid": first("UID") or None,
+        "recurrence_id": first("RECURRENCE-ID") or None,
+        "summary": first("SUMMARY") or None,
+        "description": first("DESCRIPTION") or None,
+        "location": first("LOCATION") or None,
+        "status": first("STATUS") or None,
+        "start": decode_ical_datetime(first("DTSTART"), first_params("DTSTART")),
+        "end": decode_ical_datetime(first("DTEND"), first_params("DTEND")),
+        "rrule": first("RRULE") or None,
+        "categories": [c.strip() for c in first("CATEGORIES").split(",") if c.strip()],
+        "organizer": mailto_entry(*organizer_entries[0]) if organizer_entries else None,
+        "attendees": [mailto_entry(params, value) for params, value in props.get("ATTENDEE", [])],
+        "reminders": reminders,
+        "sequence": int(first("SEQUENCE", "0") or 0),
+        "created": parse_utc_ical_timestamp(first("CREATED")),
+        "last_modified": parse_utc_ical_timestamp(first("LAST-MODIFIED")),
+    }
+
+
+def build_vevent_ics(uid: str, fields: dict[str, Any]) -> str:
+    """Build a complete VCALENDAR/VEVENT. Always a full document, never a
+    patch - `caldav_update_event` is a full replace for the same reason
+    `webdav_write_file` is, so there is exactly one code path that has to get
+    the iCalendar syntax right."""
+    summary = fields.get("summary")
+    if not summary:
+        raise ValueError("`summary` is required")
+    start = fields.get("start")
+    if not start:
+        raise ValueError("`start` is required")
+
+    now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    start_value, start_is_date = encode_ical_datetime(start, "start")
+
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//nextcloud-dynamic-mcp-server-fork//caldav//EN",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{now}",
+        f"CREATED:{now}",
+        f"LAST-MODIFIED:{now}",
+        "SEQUENCE:0",
+        f"DTSTART{';VALUE=DATE' if start_is_date else ''}:{start_value}",
+    ]
+
+    end = fields.get("end")
+    if end is not None:
+        end_value, end_is_date = encode_ical_datetime(end, "end")
+        if end_is_date != start_is_date:
+            raise ValueError("`start` and `end` must both be `YYYY-MM-DD` dates or both be datetimes")
+        lines.append(f"DTEND{';VALUE=DATE' if end_is_date else ''}:{end_value}")
+    elif not start_is_date:
+        raise ValueError("`end` is required for a timed event - only an all-day event may omit it")
+
+    lines.append(f"SUMMARY:{ical_escape_text(summary)}")
+    if fields.get("description"):
+        lines.append(f"DESCRIPTION:{ical_escape_text(fields['description'])}")
+    if fields.get("location"):
+        lines.append(f"LOCATION:{ical_escape_text(fields['location'])}")
+    if fields.get("status"):
+        status = str(fields["status"]).upper()
+        if status not in {"CONFIRMED", "TENTATIVE", "CANCELLED"}:
+            raise ValueError("`status` must be one of CONFIRMED, TENTATIVE, CANCELLED")
+        lines.append(f"STATUS:{status}")
+    if fields.get("categories"):
+        lines.append(f"CATEGORIES:{','.join(ical_escape_text(c) for c in fields['categories'])}")
+    if fields.get("rrule"):
+        rrule = str(fields["rrule"])
+        if any(ch in rrule for ch in "\r\n:"):
+            raise ValueError(
+                "`rrule` must be a single RFC 5545 value with no colon or newline, "
+                "e.g. `FREQ=WEEKLY;COUNT=10`"
+            )
+        lines.append(f"RRULE:{rrule}")
+    if fields.get("organizer_email"):
+        cn = f";CN={ical_escape_text(fields['organizer_name'])}" if fields.get("organizer_name") else ""
+        lines.append(f"ORGANIZER{cn}:mailto:{fields['organizer_email']}")
+    for attendee in fields.get("attendees") or []:
+        email = (attendee or {}).get("email")
+        if not email:
+            raise ValueError("Every entry in `attendees` needs an `email`")
+        name = attendee.get("name")
+        cn = f";CN={ical_escape_text(name)}" if name else ""
+        lines.append(f"ATTENDEE{cn}:mailto:{email}")
+    for minutes in fields.get("reminders_minutes_before") or []:
+        try:
+            minutes_int = int(minutes)
+        except (TypeError, ValueError):
+            raise ValueError(f"`reminders_minutes_before` entries must be integers, got: {minutes!r}") from None
+        if minutes_int < 0:
+            raise ValueError("`reminders_minutes_before` entries must not be negative")
+        lines.extend(
+            [
+                "BEGIN:VALARM",
+                "ACTION:DISPLAY",
+                f"DESCRIPTION:{ical_escape_text(summary)}",
+                f"TRIGGER:-PT{minutes_int}M",
+                "END:VALARM",
+            ]
+        )
+
+    lines.extend(["END:VEVENT", "END:VCALENDAR"])
+    return ICAL_NEWLINE.join(fold_ical_line(line) for line in lines) + ICAL_NEWLINE
+
+
+def xml_escape(value: str) -> str:
+    return str(value).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def caldav_home_url(auth_context: AuthContext) -> str:
+    if not auth_context.username:
+        raise ValueError("Cannot resolve a calendar path without the caller's username")
+    return f"{NEXTCLOUD_URL}{CALDAV_ROOT}/{quote(auth_context.username, safe='')}"
+
+
+def caldav_calendar_id(calendar: Any) -> str:
+    segments = webdav_path_segments(str(calendar or ""))
+    if len(segments) != 1:
+        raise ValueError("`calendar` must be a single calendar id, e.g. `personal` - not a path")
+    return segments[0]
+
+
+def caldav_calendar_url(auth_context: AuthContext, calendar: str) -> str:
+    return f"{caldav_home_url(auth_context)}/{quote(caldav_calendar_id(calendar), safe='')}"
+
+
+def caldav_object_url(auth_context: AuthContext, calendar: str, path: str) -> str:
+    """`path` is what `caldav_list_events`, `caldav_get_event` or
+    `caldav_create_event` returned - not composed from a UID by hand. See the
+    note at the top of this section."""
+    segments = webdav_path_segments(str(path or ""))
+    return f"{caldav_calendar_url(auth_context, calendar)}/" + "/".join(quote(s, safe="") for s in segments)
+
+
+CALDAV_LIST_CALENDARS_BODY = (
+    '<?xml version="1.0" encoding="utf-8"?>'
+    '<d:propfind xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/" '
+    'xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">'
+    "<d:prop>"
+    "<d:resourcetype/><d:displayname/><cs:getctag/>"
+    "<c:supported-calendar-component-set/><ic:calendar-color/>"
+    "<d:current-user-privilege-set/>"
+    "</d:prop></d:propfind>"
+)
+
+
+async def list_calendars(auth_context: AuthContext) -> dict[str, Any]:
+    """List the caller's calendars - the CalDAV analogue of
+    `webdav_list_directory`. Filtered to entries whose resourcetype actually
+    includes CALDAV:calendar, which drops the home collection itself along
+    with the scheduling inbox/outbox Nextcloud also keeps under this path."""
+    url = caldav_home_url(auth_context)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.request(
+            "PROPFIND",
+            url,
+            headers=build_webdav_headers(
+                auth_context, {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
+            ),
+            content=CALDAV_LIST_CALENDARS_BODY,
+        )
+
+    if not response.is_success:
+        payload: dict[str, Any] = {"ok": False, "status_code": response.status_code}
+        payload.update(parse_response_body(response))
+        return payload
+
+    try:
+        root = ElementTree.fromstring(response.text)
+    except ElementTree.ParseError as exc:
+        raise ValueError(f"Could not parse the calendar list response: {exc}") from exc
+
+    prefix = f"{CALDAV_ROOT}/{quote(auth_context.username or '', safe='')}"
+    calendars: list[dict[str, Any]] = []
+    for element in root.findall(f"{DAV_NS}response"):
+        prop = element.find(f"{DAV_NS}propstat/{DAV_NS}prop")
+        if prop is None:
+            continue
+        resourcetype = prop.find(f"{DAV_NS}resourcetype")
+        if resourcetype is None or resourcetype.find(f"{CALDAV_NS}calendar") is None:
+            continue
+
+        href = unquote((element.findtext(f"{DAV_NS}href") or "").strip())
+        relative = href[len(prefix):].strip("/") if href.startswith(prefix) else href.strip("/")
+
+        privilege_set = prop.find(f"{DAV_NS}current-user-privilege-set")
+        writable = (
+            privilege_set is None
+            or privilege_set.find(f".//{DAV_NS}write") is not None
+            or privilege_set.find(f".//{DAV_NS}all") is not None
+        )
+        components_el = prop.find(f"{CALDAV_NS}supported-calendar-component-set")
+        components = (
+            [comp.get("name") for comp in components_el.findall(f"{CALDAV_NS}comp")]
+            if components_el is not None
+            else []
+        )
+        calendars.append(
+            {
+                "id": relative,
+                "display_name": prop.findtext(f"{DAV_NS}displayname") or relative,
+                "color": prop.findtext(f"{APPLE_ICAL_NS}calendar-color"),
+                "ctag": prop.findtext(f"{CALENDARSERVER_NS}getctag"),
+                "components": components,
+                "writable": writable,
+            }
+        )
+    return {"ok": True, "status_code": response.status_code, "calendars": calendars}
+
+
+def format_time_bound(value: Any, field: str) -> str:
+    text = str(value)
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+        parsed = datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError(f"`{field}` is not a valid `YYYY-MM-DD` date or ISO-8601 datetime: {exc}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def build_calendar_query_body(time_range_xml: str) -> str:
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<c:calendar-query xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        "<d:prop><d:getetag/><c:calendar-data/></d:prop>"
+        '<c:filter><c:comp-filter name="VCALENDAR"><c:comp-filter name="VEVENT">'
+        f"{time_range_xml}"
+        "</c:comp-filter></c:comp-filter></c:filter>"
+        "</c:calendar-query>"
+    )
+
+
+async def list_events(
+    auth_context: AuthContext,
+    calendar: str | None = None,
+    time_min: str | None = None,
+    time_max: str | None = None,
+    all_time: bool = False,
+    limit: Any = None,
+) -> dict[str, Any]:
+    """List events, from one `calendar` or across every calendar the caller can
+    see. Bounded to a time window by default - a CalDAV REPORT has no
+    pagination, so an unbounded query against a calendar with years of
+    recurring events could return all of it."""
+    try:
+        capped_limit = max(1, min(int(limit or EVENT_LIST_DEFAULT_LIMIT), EVENT_LIST_MAX_LIMIT))
+    except (TypeError, ValueError):
+        capped_limit = EVENT_LIST_DEFAULT_LIMIT
+
+    if calendar:
+        calendar_ids = [caldav_calendar_id(calendar)]
+    else:
+        listing = await list_calendars(auth_context)
+        if not listing.get("ok"):
+            return listing
+        calendar_ids = [entry["id"] for entry in listing["calendars"]]
+
+    time_range_xml = ""
+    if not all_time:
+        now = datetime.now(timezone.utc)
+        start = format_time_bound(time_min, "time_min") if time_min else now.strftime("%Y%m%dT%H%M%SZ")
+        end = (
+            format_time_bound(time_max, "time_max")
+            if time_max
+            else (now + timedelta(days=DEFAULT_EVENT_WINDOW_DAYS)).strftime("%Y%m%dT%H%M%SZ")
+        )
+        time_range_xml = f'<c:time-range start="{start}" end="{end}"/>'
+    body = build_calendar_query_body(time_range_xml)
+
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+    events: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        for calendar_id in calendar_ids:
+            url = caldav_calendar_url(auth_context, calendar_id)
+            response = await client.request(
+                "REPORT",
+                url,
+                headers=build_webdav_headers(
+                    auth_context, {"Depth": "1", "Content-Type": "application/xml; charset=utf-8"}
+                ),
+                content=body,
+            )
+            if response.status_code == 404:
+                continue
+            if not response.is_success:
+                errors.append({"calendar": calendar_id, "status_code": response.status_code})
+                continue
+            try:
+                root = ElementTree.fromstring(response.text)
+            except ElementTree.ParseError as exc:
+                errors.append({"calendar": calendar_id, "error": f"Could not parse response: {exc}"})
+                continue
+
+            prefix = f"{CALDAV_ROOT}/{quote(auth_context.username or '', safe='')}/{quote(calendar_id, safe='')}"
+            for element in root.findall(f"{DAV_NS}response"):
+                prop = element.find(f"{DAV_NS}propstat/{DAV_NS}prop")
+                if prop is None:
+                    continue
+                calendar_data = prop.findtext(f"{CALDAV_NS}calendar-data")
+                if not calendar_data:
+                    continue
+                href = unquote((element.findtext(f"{DAV_NS}href") or "").strip())
+                relative = href[len(prefix):].strip("/") if href.startswith(prefix) else href.rsplit("/", 1)[-1]
+
+                blocks = extract_blocks(unfold_ical_lines(calendar_data), "VEVENT")
+                if not blocks:
+                    continue
+                master = next(
+                    (b for b in blocks if not any(line.upper().startswith("RECURRENCE-ID") for line in b)),
+                    blocks[0],
+                )
+                events.append(
+                    {
+                        "calendar": calendar_id,
+                        "path": relative,
+                        "etag": normalize_etag(prop.findtext(f"{DAV_NS}getetag")),
+                        "override_count": len(blocks) - 1,
+                        **parse_vevent_block(master),
+                    }
+                )
+
+    events.sort(key=lambda event: ((event.get("start") or {}).get("value") or ""))
+    return {
+        "ok": True,
+        "calendars_searched": calendar_ids,
+        "total_matches": len(events),
+        "returned": min(len(events), capped_limit),
+        "truncated": len(events) > capped_limit,
+        "events": events[:capped_limit],
+        "errors": errors or None,
+    }
+
+
+async def get_event(auth_context: AuthContext, calendar: str = None, path: str = None) -> dict[str, Any]:
+    if not calendar or not path:
+        raise ValueError("`calendar` and `path` are required")
+    url = caldav_object_url(auth_context, calendar, path)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.get(url, headers=build_webdav_headers(auth_context))
+
+    if response.status_code == 404:
+        return {
+            "ok": False, "status_code": 404, "calendar": calendar, "path": path,
+            "error": f"No event at `{path}` in calendar `{calendar}`.",
+        }
+    if not response.is_success:
+        payload: dict[str, Any] = {"ok": False, "status_code": response.status_code, "calendar": calendar, "path": path}
+        payload.update(parse_response_body(response))
+        return payload
+
+    blocks = extract_blocks(unfold_ical_lines(response.text), "VEVENT")
+    if not blocks:
+        return {
+            "ok": False, "status_code": response.status_code, "calendar": calendar, "path": path,
+            "error": "This calendar object has no VEVENT - it may be a VTODO or VJOURNAL, which "
+                     "this server does not parse.",
+        }
+
+    parsed_blocks = [parse_vevent_block(block) for block in blocks]
+    master = next((entry for entry in parsed_blocks if not entry.get("recurrence_id")), parsed_blocks[0])
+    return {
+        "ok": True,
+        "status_code": response.status_code,
+        "calendar": calendar,
+        "path": path,
+        "etag": normalize_etag(response.headers.get("etag")),
+        **master,
+        "overrides": [entry for entry in parsed_blocks if entry is not master],
+        "raw_ics": response.text,
+    }
+
+
+async def create_event(
+    auth_context: AuthContext,
+    calendar: str = None,
+    summary: str = None,
+    start: str = None,
+    end: str = None,
+    description: str = None,
+    location: str = None,
+    status: str = None,
+    categories: list[str] = None,
+    rrule: str = None,
+    organizer_email: str = None,
+    organizer_name: str = None,
+    attendees: list[Any] = None,
+    reminders_minutes_before: list[Any] = None,
+    uid: str = None,
+) -> dict[str, Any]:
+    if not calendar:
+        raise ValueError("`calendar` is required")
+    fields = dict(
+        summary=summary, start=start, end=end, description=description, location=location,
+        status=status, categories=categories, rrule=rrule, organizer_email=organizer_email,
+        organizer_name=organizer_name, attendees=attendees, reminders_minutes_before=reminders_minutes_before,
+    )
+    event_uid = str(uid) if uid else str(uuid.uuid4())
+    ics = build_vevent_ics(event_uid, fields)
+    path = f"{event_uid}.ics"
+    url = caldav_object_url(auth_context, calendar, path)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.put(
+            url,
+            headers=build_webdav_headers(
+                auth_context, {"Content-Type": "text/calendar; charset=utf-8", "If-None-Match": "*"}
+            ),
+            content=ics.encode("utf-8"),
+        )
+
+    payload: dict[str, Any] = {
+        "ok": response.is_success, "status_code": response.status_code,
+        "calendar": calendar, "path": path, "uid": event_uid,
+        "etag": normalize_etag(response.headers.get("etag")),
+    }
+    if response.status_code == 412:
+        payload["error"] = f"An event already exists at `{path}`. Pass a different `uid`, or omit it to generate one."
+    elif response.status_code in (404, 409):
+        payload["error"] = f"No calendar `{calendar}` for this caller, or it refused a new event there."
+    elif not response.is_success:
+        payload.update(parse_response_body(response))
+    return payload
+
+
+async def update_event(
+    auth_context: AuthContext,
+    calendar: str = None,
+    path: str = None,
+    uid: str = None,
+    summary: str = None,
+    start: str = None,
+    end: str = None,
+    description: str = None,
+    location: str = None,
+    status: str = None,
+    categories: list[str] = None,
+    rrule: str = None,
+    organizer_email: str = None,
+    organizer_name: str = None,
+    attendees: list[Any] = None,
+    reminders_minutes_before: list[Any] = None,
+    if_match: str = None,
+) -> dict[str, Any]:
+    if not calendar or not path or not uid:
+        raise ValueError("`calendar`, `path` and `uid` are required")
+    fields = dict(
+        summary=summary, start=start, end=end, description=description, location=location,
+        status=status, categories=categories, rrule=rrule, organizer_email=organizer_email,
+        organizer_name=organizer_name, attendees=attendees, reminders_minutes_before=reminders_minutes_before,
+    )
+    ics = build_vevent_ics(uid, fields)
+    url = caldav_object_url(auth_context, calendar, path)
+    extra_headers = {"Content-Type": "text/calendar; charset=utf-8"}
+    if if_match:
+        extra_headers["If-Match"] = normalize_etag(if_match)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.put(
+            url, headers=build_webdav_headers(auth_context, extra_headers), content=ics.encode("utf-8")
+        )
+
+    payload: dict[str, Any] = {
+        "ok": response.is_success, "status_code": response.status_code,
+        "calendar": calendar, "path": path, "uid": uid,
+        "etag": normalize_etag(response.headers.get("etag")),
+    }
+    if response.status_code == 412:
+        payload["error"] = (
+            "The event changed since `if_match` was read. Call `caldav_get_event` again and "
+            "retry with the current etag."
+        )
+    elif response.status_code == 404:
+        payload["error"] = f"No event at `{path}` in calendar `{calendar}`."
+    elif not response.is_success:
+        payload.update(parse_response_body(response))
+    return payload
+
+
+async def delete_event(
+    auth_context: AuthContext, calendar: str = None, path: str = None, if_match: str = None
+) -> dict[str, Any]:
+    if not calendar or not path:
+        raise ValueError("`calendar` and `path` are required")
+    url = caldav_object_url(auth_context, calendar, path)
+    extra_headers = {"If-Match": normalize_etag(if_match)} if if_match else None
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.request("DELETE", url, headers=build_webdav_headers(auth_context, extra_headers))
+
+    payload: dict[str, Any] = {"ok": response.is_success, "status_code": response.status_code, "calendar": calendar, "path": path}
+    if response.status_code == 404:
+        payload["error"] = f"No event at `{path}` in calendar `{calendar}`."
+    elif response.status_code == 412:
+        payload["error"] = "The event changed since `if_match` was read; re-fetch it and retry if the delete should still happen."
+    elif not response.is_success:
+        payload.update(parse_response_body(response))
+    return payload
+
+
+CALENDAR_COLOR_PATTERN = re.compile(r"#[0-9A-Fa-f]{6}([0-9A-Fa-f]{2})?$")
+
+
+async def create_calendar(
+    auth_context: AuthContext, calendar: str = None, display_name: str = None, color: str = None
+) -> dict[str, Any]:
+    if not calendar:
+        raise ValueError("`calendar` is required")
+    calendar_id = caldav_calendar_id(calendar)
+
+    props_xml = ""
+    if display_name:
+        props_xml += f"<d:displayname>{xml_escape(display_name)}</d:displayname>"
+    if color:
+        if not CALENDAR_COLOR_PATTERN.fullmatch(color):
+            raise ValueError("`color` must be a hex color like `#3388FF` or `#3388FFFF`")
+        props_xml += f'<ic:calendar-color xmlns:ic="http://apple.com/ns/ical/">{color}</ic:calendar-color>'
+
+    body = (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        '<c:mkcalendar xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">'
+        f"<d:set><d:prop>{props_xml}</d:prop></d:set>"
+        "</c:mkcalendar>"
+    )
+    url = caldav_calendar_url(auth_context, calendar_id)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.request(
+            "MKCALENDAR", url,
+            headers=build_webdav_headers(auth_context, {"Content-Type": "application/xml; charset=utf-8"}),
+            content=body,
+        )
+
+    payload: dict[str, Any] = {"ok": response.is_success, "status_code": response.status_code, "calendar": calendar_id}
+    if response.status_code == 405:
+        payload["error"] = f"A calendar already exists at `{calendar_id}`."
+    elif not response.is_success:
+        payload.update(parse_response_body(response))
+    return payload
+
+
+async def delete_calendar(auth_context: AuthContext, calendar: str = None, confirm: bool = False) -> dict[str, Any]:
+    if not calendar:
+        raise ValueError("`calendar` is required")
+    calendar_id = caldav_calendar_id(calendar)
+    if not confirm:
+        return {
+            "ok": False, "calendar": calendar_id,
+            "error": f"Deleting calendar `{calendar_id}` removes every event inside it. Pass `confirm` as true to proceed.",
+        }
+
+    url = caldav_calendar_url(auth_context, calendar_id)
+    timeout = httpx2.Timeout(DISCOVERY_TIMEOUT_SECONDS)
+
+    async with httpx2.AsyncClient(timeout=timeout) as client:
+        response = await client.request("DELETE", url, headers=build_webdav_headers(auth_context))
+
+    payload: dict[str, Any] = {"ok": response.is_success, "status_code": response.status_code, "calendar": calendar_id}
+    if response.status_code == 404:
+        payload["error"] = f"No calendar at `{calendar_id}`."
+    elif not response.is_success:
+        payload.update(parse_response_body(response))
+    return payload
+
+
+CALDAV_HANDLERS = {
+    "list_calendars": list_calendars,
+    "list_events": list_events,
+    "get_event": get_event,
+    "create_event": create_event,
+    "update_event": update_event,
+    "delete_event": delete_event,
+    "create_calendar": create_calendar,
+    "delete_calendar": delete_calendar,
+}
+
+BUILTIN_HANDLERS = {**WEBDAV_HANDLERS, **CALDAV_HANDLERS}
+
+
 def builtin_operation(
     name: str,
     method: str,
@@ -1324,13 +2149,16 @@ def builtin_operation(
     description: str,
     properties: dict[str, Any],
     required: list[str],
+    app_id: str = WEBDAV_APP_ID,
+    app_name: str = "WebDAV files",
+    path: str = f"{WEBDAV_ROOT}/{{user}}/{{path}}",
 ) -> OperationDefinition:
     return OperationDefinition(
         name=name,
-        app_id=WEBDAV_APP_ID,
-        app_name="WebDAV files",
+        app_id=app_id,
+        app_name=app_name,
         method=method,
-        path=f"{WEBDAV_ROOT}/{{user}}/{{path}}",
+        path=path,
         summary=summary,
         description=description,
         input_schema={
@@ -1347,6 +2175,203 @@ def builtin_operation(
         body_content_type=None,
         handler=handler,
     )
+
+
+CALDAV_CALENDAR_PROPERTY = {"type": "string", "description": "Calendar id, as returned by `caldav_list_calendars`."}
+CALDAV_EVENT_PATH_PROPERTY = {
+    "type": "string",
+    "description": "Event path within the calendar, exactly as returned by `caldav_list_events`, "
+                   "`caldav_get_event` or `caldav_create_event` - a calendar object's filename is "
+                   "not guaranteed to match its `uid`, so this must not be constructed by hand.",
+}
+CALDAV_START_PROPERTY = {
+    "type": "string",
+    "description": "`YYYY-MM-DD` for an all-day event, or a full ISO-8601 datetime with a UTC "
+                   "offset or `Z`, e.g. `2026-09-20T14:00:00+08:00`. A bare local datetime with "
+                   "no offset is rejected - CalDAV has no notion of the caller's timezone.",
+}
+CALDAV_END_PROPERTY = {
+    "type": "string",
+    "description": "Same format as `start`. Required for a timed event; optional for a single "
+                   "all-day event, where it defaults to the same day as `start`.",
+}
+CALDAV_EVENT_OPTIONAL_FIELDS: dict[str, Any] = {
+    "description": {"type": "string", "description": "Free-text event body."},
+    "location": {"type": "string"},
+    "status": {"type": "string", "enum": ["CONFIRMED", "TENTATIVE", "CANCELLED"]},
+    "categories": {"type": "array", "items": {"type": "string"}},
+    "rrule": {
+        "type": "string",
+        "description": "Raw RFC 5545 recurrence rule value, e.g. `FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10`. "
+                       "Passed through as-is - not translated from natural language.",
+    },
+    "organizer_email": {"type": "string"},
+    "organizer_name": {"type": "string"},
+    "attendees": {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {"email": {"type": "string"}, "name": {"type": "string"}},
+            "required": ["email"],
+        },
+    },
+    "reminders_minutes_before": {
+        "type": "array",
+        "items": {"type": "integer", "minimum": 0},
+        "description": "One popup reminder per entry, that many minutes before `start`.",
+    },
+}
+
+# Hand-written because ocs_api_viewer cannot describe them: calendars are CalDAV
+# (RFC 4791), which is not an OCS REST API and so is invisible to discovery
+# entirely. Registering them in the catalogue rather than as their own tools
+# keeps the fixed surface small and delivers each operation's warnings through
+# `describe`, at the moment of use, instead of parking them in every client's
+# context for the whole session.
+CALDAV_OPERATIONS = [
+    builtin_operation(
+        "caldav_list_calendars", "PROPFIND", "list_calendars",
+        "List the caller's calendars",
+        "List every calendar the caller can see - id, display name, color, ctag (bumps whenever "
+        "the calendar's contents change) and whether the caller can write to it. Calendars live "
+        "under CalDAV (RFC 4791), which `ocs_api_viewer` does not describe at all, so this is "
+        "hand-written the same way the webdav_* operations are for files.",
+        {}, [],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/",
+    ),
+    builtin_operation(
+        "caldav_list_events", "REPORT", "list_events",
+        "List events in a time window",
+        "List events, either from one `calendar` or across every calendar the caller can see when "
+        "it is omitted. Bounded to a time window by default - `time_min`/`time_max` (each "
+        "`YYYY-MM-DD` or a full ISO-8601 datetime), defaulting to now through "
+        f"{DEFAULT_EVENT_WINDOW_DAYS} days out - because a CalDAV REPORT has no pagination and an "
+        "unbounded query against a calendar with years of recurring events could return all of it. "
+        "Pass `all_time` to lift the bound deliberately. A recurring event is returned once, as its "
+        "master; `override_count` says how many dated exceptions exist without expanding them. Only "
+        "VEVENT (calendar events) is covered - VTODO and VJOURNAL entries are not returned.",
+        {
+            "calendar": CALDAV_CALENDAR_PROPERTY,
+            "time_min": {"type": "string", "description": "Start of the window. Defaults to now."},
+            "time_max": {
+                "type": "string",
+                "description": f"End of the window. Defaults to `time_min` plus {DEFAULT_EVENT_WINDOW_DAYS} days.",
+            },
+            "all_time": {
+                "type": "boolean",
+                "description": "Ignore time_min/time_max and return every event. Can be slow or very "
+                               "large on a busy calendar - prefer a bounded window.",
+            },
+            "limit": {
+                "type": "integer", "minimum": 1, "maximum": EVENT_LIST_MAX_LIMIT,
+                "description": f"Maximum events to return, applied after sorting by start time. "
+                               f"Defaults to {EVENT_LIST_DEFAULT_LIMIT}.",
+            },
+        },
+        [],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/",
+    ),
+    builtin_operation(
+        "caldav_get_event", "GET", "get_event",
+        "Get one event's full details",
+        "Read one event - every field `caldav_list_events` summarises, plus description, "
+        "attendees, reminders, the raw iCalendar text and any dated recurrence overrides. Times "
+        "tagged with an IANA zone (`TZID=Asia/Taipei`, say) are returned as the wall-clock time "
+        "plus that zone name rather than converted to an absolute instant - this server does not "
+        "expand `VTIMEZONE` tables. Carries an `etag`, for a guarded `caldav_update_event` or "
+        "`caldav_delete_event` afterwards.",
+        {"calendar": CALDAV_CALENDAR_PROPERTY, "path": CALDAV_EVENT_PATH_PROPERTY},
+        ["calendar", "path"],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/{{path}}",
+    ),
+    builtin_operation(
+        "caldav_create_event", "PUT", "create_event",
+        "Create a new event",
+        "Create a single VEVENT in `calendar`. `uid` is generated if omitted; pass one only to "
+        "control the event's identity, e.g. when importing from elsewhere. Fails rather than "
+        "overwriting if that `uid` is already in use. Returns the `path` to pass to "
+        "`caldav_get_event`, `caldav_update_event` or `caldav_delete_event`.",
+        {
+            "calendar": CALDAV_CALENDAR_PROPERTY,
+            "summary": {"type": "string", "description": "Event title."},
+            "start": CALDAV_START_PROPERTY,
+            "end": CALDAV_END_PROPERTY,
+            **CALDAV_EVENT_OPTIONAL_FIELDS,
+            "uid": {"type": "string", "description": "Explicit UID. A random one is generated otherwise."},
+        },
+        ["calendar", "summary", "start"],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/",
+    ),
+    builtin_operation(
+        "caldav_update_event", "PUT", "update_event",
+        "Replace an existing event",
+        "Replace an event's entire iCalendar content - like `webdav_write_file`, this is a full "
+        "replace, not a field-level patch, so fields left out are cleared rather than preserved. "
+        "Re-read the event with `caldav_get_event` first, apply the change to what it returned, and "
+        "send everything back including the unchanged fields. `uid` must be the event's existing "
+        "UID - changing it would make this a different event to every other CalDAV client. Pass "
+        "`if_match` from a prior read to fail with 412 instead of discarding a concurrent edit.",
+        {
+            "calendar": CALDAV_CALENDAR_PROPERTY,
+            "path": CALDAV_EVENT_PATH_PROPERTY,
+            "uid": {"type": "string", "description": "The event's existing UID, from `caldav_get_event`."},
+            "summary": {"type": "string"},
+            "start": CALDAV_START_PROPERTY,
+            "end": CALDAV_END_PROPERTY,
+            **CALDAV_EVENT_OPTIONAL_FIELDS,
+            "if_match": {
+                "type": "string",
+                "description": "ETag from a prior `caldav_get_event`. Omit only when deliberately overwriting.",
+            },
+        },
+        ["calendar", "path", "uid", "summary", "start"],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/{{path}}",
+    ),
+    builtin_operation(
+        "caldav_delete_event", "DELETE", "delete_event",
+        "Delete an event",
+        "Delete one event. Pass `if_match` from a prior read to refuse the delete if the event "
+        "changed since - useful before removing something an automated pass found stale.",
+        {
+            "calendar": CALDAV_CALENDAR_PROPERTY,
+            "path": CALDAV_EVENT_PATH_PROPERTY,
+            "if_match": {"type": "string", "description": "ETag from a prior read. Optional."},
+        },
+        ["calendar", "path"],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/{{path}}",
+    ),
+    builtin_operation(
+        "caldav_create_calendar", "MKCALENDAR", "create_calendar",
+        "Create a new calendar",
+        "Create a new calendar collection. `calendar` becomes its id (the URL segment other "
+        "caldav_* operations address it by), so keep it URL-safe; `display_name` is what Nextcloud "
+        "shows in its UI. `color` is best-effort - most CalDAV servers, Nextcloud included, accept "
+        "it, but nothing guarantees it.",
+        {
+            "calendar": CALDAV_CALENDAR_PROPERTY,
+            "display_name": {"type": "string"},
+            "color": {"type": "string", "description": "Hex color, e.g. `#3388FF`."},
+        },
+        ["calendar"],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/",
+    ),
+    builtin_operation(
+        "caldav_delete_calendar", "DELETE", "delete_calendar",
+        "Delete a calendar and everything in it",
+        "Delete a calendar and every event inside it. Unlike `webdav_delete`, Nextcloud's calendar "
+        "trash retention is not something this server has verified, so treat this as permanent. "
+        "Refused unless `confirm` is true.",
+        {
+            "calendar": CALDAV_CALENDAR_PROPERTY,
+            "confirm": {
+                "type": "boolean",
+                "description": "Must be true - confirms the whole calendar should be removed.",
+            },
+        },
+        ["calendar"],
+        app_id=CALDAV_APP_ID, app_name="CalDAV calendars", path=f"{CALDAV_ROOT}/{{user}}/{{calendar}}/",
+    ),
+]
 
 
 # Hand-written because ocs_api_viewer cannot describe them: the OCS API reports
@@ -1448,6 +2473,7 @@ BUILTIN_OPERATIONS: dict[str, OperationDefinition] = {
             ["path"],
         ),
     ]
+    + CALDAV_OPERATIONS
 }
 
 
@@ -1572,7 +2598,7 @@ async def call_result(
             # `arguments` is passed through unvalidated, so trim it to the schema
             # rather than letting a stray key become an unexpected keyword.
             accepted = set(definition.input_schema.get("properties", {}))
-            payload = await WEBDAV_HANDLERS[definition.handler](
+            payload = await BUILTIN_HANDLERS[definition.handler](
                 auth_context,
                 **{key: value for key, value in operation_arguments.items() if key in accepted},
             )

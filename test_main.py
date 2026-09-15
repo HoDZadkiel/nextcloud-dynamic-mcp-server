@@ -1281,13 +1281,18 @@ def test_a_webdav_operation_still_refuses_an_uncredentialed_caller():
 
 def test_the_find_description_advertises_the_builtin_webdav_app():
     """Nothing discovers these, so without the index entry a client would have no
-    way to learn they exist."""
+    way to learn they exist. webdav and caldav are counted separately, not
+    lumped into one bucket, so adding either does not silently misreport the
+    other's count."""
     listed = run_mcp(
         lambda client: post_mcp(client, "tools/list", headers=AUTH_HEADERS)
     )["result"]
     find = next(t for t in listed["tools"] if t["name"] == main.FIND_TOOL_NAME)
 
-    assert f"{main.WEBDAV_APP_ID}:{len(main.BUILTIN_OPERATIONS)}" in find["description"]
+    webdav_count = sum(1 for op in main.BUILTIN_OPERATIONS.values() if op.app_id == main.WEBDAV_APP_ID)
+    caldav_count = sum(1 for op in main.BUILTIN_OPERATIONS.values() if op.app_id == main.CALDAV_APP_ID)
+    assert f"{main.WEBDAV_APP_ID}:{webdav_count}" in find["description"]
+    assert f"{main.CALDAV_APP_ID}:{caldav_count}" in find["description"]
 
 
 def test_healthcheck_does_not_leak_the_nextcloud_url():
@@ -1303,3 +1308,542 @@ def test_healthcheck_does_not_leak_the_nextcloud_url():
     assert "nextcloud_url" not in payload
     assert "apps" not in payload
     assert payload["tool_count"] == 0
+
+
+# --- CalDAV --------------------------------------------------------------------
+
+
+def test_caldav_calendar_url_encodes_and_rejects_a_multi_segment_id():
+    url = main.caldav_calendar_url(webdav_auth(), "知識庫")
+    assert url == f"{main.NEXTCLOUD_URL}/remote.php/dav/calendars/alice/%E7%9F%A5%E8%AD%98%E5%BA%AB"
+
+    try:
+        main.caldav_calendar_id("a/b")
+    except ValueError as exc:
+        assert "single calendar id" in str(exc)
+    else:
+        raise AssertionError("multi-segment calendar id was not rejected")
+
+
+def test_caldav_object_url_rejects_traversal():
+    """`caldav_object_url` reuses `webdav_path_segments`, so a `path` that tries
+    to climb out of the calendar is rejected the same way a file path is."""
+    for path in ("../evil.ics", "a/../../x.ics"):
+        try:
+            main.caldav_object_url(webdav_auth(), "personal", path)
+        except ValueError:
+            continue
+        raise AssertionError(f"traversal not rejected: {path}")
+
+
+def test_caldav_home_url_requires_a_username():
+    try:
+        main.caldav_home_url(main.AuthContext(auth_header="Basic x", source="s", cache_key="c"))
+    except ValueError as exc:
+        assert "username" in str(exc)
+    else:
+        raise AssertionError("missing username was not rejected")
+
+
+def test_ical_text_escaping_round_trips_through_unescape():
+    raw = "Comma, semicolon; backslash\\ and a\nnewline"
+    assert main.ical_unescape_text(main.ical_escape_text(raw)) == raw
+
+
+def test_ical_line_folding_round_trips_and_stays_under_75_octets_per_line():
+    long_value = "SUMMARY:" + ("x" * 200)
+    folded = main.fold_ical_line(long_value)
+    folded_lines = folded.split(main.ICAL_NEWLINE)
+
+    assert len(folded_lines) > 1
+    assert all(len(line.encode("utf-8")) <= 75 for line in folded_lines)
+    # Unfolding unwinds exactly what folding wrapped, wherever it happened.
+    assert "".join(main.unfold_ical_lines(folded)) == long_value
+
+
+def test_ical_line_folding_does_not_split_a_multibyte_utf8_character():
+    long_value = "SUMMARY:" + ("知" * 60)  # each CJK char is 3 UTF-8 bytes
+    folded = main.fold_ical_line(long_value)
+    for line in folded.split(main.ICAL_NEWLINE):
+        # A split multi-byte sequence would fail to decode as UTF-8 at all -
+        # the line was already decoded when fold_ical_line built it, so the
+        # real assertion is just that no byte limit was exceeded mid-character.
+        assert len(line.encode("utf-8")) <= 75
+
+
+def test_encode_ical_datetime_accepts_an_all_day_date():
+    value, is_date = main.encode_ical_datetime("2026-09-20", "start")
+    assert (value, is_date) == ("20260920", True)
+
+
+def test_encode_ical_datetime_converts_an_offset_datetime_to_utc():
+    value, is_date = main.encode_ical_datetime("2026-09-20T14:00:00+08:00", "start")
+    assert (value, is_date) == ("20260920T060000Z", False)
+
+
+def test_encode_ical_datetime_rejects_a_bare_local_datetime():
+    """CalDAV has no notion of the caller's timezone, so a naive datetime is
+    refused rather than silently treated as UTC or as floating local time."""
+    try:
+        main.encode_ical_datetime("2026-09-20T14:00:00", "start")
+    except ValueError as exc:
+        assert "UTC offset" in str(exc)
+    else:
+        raise AssertionError("naive datetime was not rejected")
+
+
+def test_decode_ical_datetime_reports_a_tzid_qualified_time_without_converting_it():
+    """No VTIMEZONE table is parsed, so a TZID-qualified time is returned as
+    its wall-clock value plus the zone name, not as an absolute instant."""
+    decoded = main.decode_ical_datetime("20260920T140000", {"TZID": "Asia/Taipei"})
+    assert decoded == {"value": "2026-09-20T14:00:00", "all_day": False, "timezone": "Asia/Taipei"}
+
+
+def test_build_vevent_ics_requires_summary_and_start():
+    for fields in ({"start": "2026-09-20T09:00:00Z"}, {"summary": "x"}):
+        try:
+            main.build_vevent_ics("uid", fields)
+        except ValueError:
+            continue
+        raise AssertionError(f"missing required field was not rejected: {fields}")
+
+
+def test_build_vevent_ics_requires_an_end_for_a_timed_event():
+    try:
+        main.build_vevent_ics("uid", {"summary": "x", "start": "2026-09-20T09:00:00Z"})
+    except ValueError as exc:
+        assert "`end` is required" in str(exc)
+    else:
+        raise AssertionError("missing end on a timed event was not rejected")
+
+
+def test_build_vevent_ics_allows_a_single_day_all_day_event_without_an_end():
+    ics = main.build_vevent_ics("uid", {"summary": "x", "start": "2026-09-20"})
+    assert "DTSTART;VALUE=DATE:20260920" in ics
+    assert "DTEND" not in ics
+
+
+def test_build_vevent_ics_rejects_mixing_a_date_start_with_a_datetime_end():
+    try:
+        main.build_vevent_ics(
+            "uid", {"summary": "x", "start": "2026-09-20", "end": "2026-09-20T10:00:00Z"}
+        )
+    except ValueError as exc:
+        assert "both be" in str(exc)
+    else:
+        raise AssertionError("mismatched start/end kinds were not rejected")
+
+
+def test_build_vevent_ics_round_trips_every_field_through_parse_vevent_block():
+    fields = dict(
+        summary="Team sync; planning, review",
+        start="2026-09-20T14:00:00+08:00",
+        end="2026-09-20T15:00:00+08:00",
+        description="Line1\nLine2, with a comma and a semicolon; here",
+        location="Room A",
+        status="confirmed",
+        categories=["Work", "Important"],
+        rrule="FREQ=WEEKLY;COUNT=5",
+        organizer_email="boss@example.com",
+        organizer_name="Boss Person",
+        attendees=[{"email": "a@example.com", "name": "Alice"}, {"email": "b@example.com"}],
+        reminders_minutes_before=[15, 60],
+    )
+    ics = main.build_vevent_ics("test-uid-123", fields)
+    blocks = main.extract_blocks(main.unfold_ical_lines(ics), "VEVENT")
+    parsed = main.parse_vevent_block(blocks[0])
+
+    assert parsed["uid"] == "test-uid-123"
+    assert parsed["summary"] == fields["summary"]
+    assert parsed["description"] == fields["description"]
+    assert parsed["location"] == "Room A"
+    assert parsed["status"] == "CONFIRMED"
+    assert parsed["categories"] == ["Work", "Important"]
+    assert parsed["rrule"] == "FREQ=WEEKLY;COUNT=5"
+    assert parsed["organizer"] == {"email": "boss@example.com", "name": "Boss Person"}
+    assert parsed["attendees"] == [
+        {"email": "a@example.com", "name": "Alice"},
+        {"email": "b@example.com", "name": None},
+    ]
+    assert parsed["reminders"] == [
+        {"trigger": "-PT15M", "minutes_before": 15},
+        {"trigger": "-PT60M", "minutes_before": 60},
+    ]
+    assert parsed["start"] == {"value": "2026-09-20T06:00:00+00:00", "all_day": False, "timezone": "UTC"}
+
+
+def test_build_vevent_ics_rejects_an_rrule_with_a_colon():
+    try:
+        main.build_vevent_ics(
+            "uid", {"summary": "x", "start": "2026-09-20T09:00:00Z", "end": "2026-09-20T10:00:00Z",
+                    "rrule": "FREQ:WEEKLY"}
+        )
+    except ValueError as exc:
+        assert "RRULE" in str(exc) or "colon" in str(exc)
+    else:
+        raise AssertionError("an rrule with a colon was not rejected")
+
+
+CALENDAR_LIST_MULTISTATUS = """<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:cs="http://calendarserver.org/ns/"
+               xmlns:c="urn:ietf:params:xml:ns:caldav" xmlns:ic="http://apple.com/ns/ical/">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/></d:resourcetype>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/inbox/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/><c:schedule-inbox/></d:resourcetype>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/personal/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+      <d:displayname>Personal</d:displayname>
+      <cs:getctag>ctag-123</cs:getctag>
+      <ic:calendar-color>#3388FF</ic:calendar-color>
+      <c:supported-calendar-component-set><c:comp name="VEVENT"/></c:supported-calendar-component-set>
+      <d:current-user-privilege-set><d:privilege><d:read/></d:privilege></d:current-user-privilege-set>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/shared/</d:href>
+    <d:propstat><d:prop>
+      <d:resourcetype><d:collection/><c:calendar/></d:resourcetype>
+      <d:displayname>Shared</d:displayname>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"""
+
+
+def test_list_calendars_filters_out_the_home_collection_and_the_schedule_inbox():
+    response = FakeResponse(body=CALENDAR_LIST_MULTISTATUS.encode("utf-8"))
+
+    payload, record = run_webdav(lambda: main.list_calendars(webdav_auth()), response)
+
+    assert record["method"] == "PROPFIND"
+    ids = [c["id"] for c in payload["calendars"]]
+    assert ids == ["personal", "shared"]
+
+
+def test_list_calendars_reports_color_ctag_and_components():
+    response = FakeResponse(body=CALENDAR_LIST_MULTISTATUS.encode("utf-8"))
+
+    payload, _ = run_webdav(lambda: main.list_calendars(webdav_auth()), response)
+
+    personal = next(c for c in payload["calendars"] if c["id"] == "personal")
+    assert personal["display_name"] == "Personal"
+    assert personal["color"] == "#3388FF"
+    assert personal["ctag"] == "ctag-123"
+    assert personal["components"] == ["VEVENT"]
+
+
+def test_list_calendars_reads_the_privilege_set_for_writability():
+    response = FakeResponse(body=CALENDAR_LIST_MULTISTATUS.encode("utf-8"))
+
+    payload, _ = run_webdav(lambda: main.list_calendars(webdav_auth()), response)
+
+    by_id = {c["id"]: c for c in payload["calendars"]}
+    # "personal" only reports a read privilege - not writable.
+    assert by_id["personal"]["writable"] is False
+    # "shared" has no privilege-set element at all - the server did not say
+    # otherwise, so it is assumed writable rather than hidden as read-only.
+    assert by_id["shared"]["writable"] is True
+
+
+EVENT_REPORT_MULTISTATUS = """<?xml version="1.0"?>
+<d:multistatus xmlns:d="DAV:" xmlns:c="urn:ietf:params:xml:ns:caldav">
+  <d:response>
+    <d:href>/remote.php/dav/calendars/alice/personal/abc-123.ics</d:href>
+    <d:propstat><d:prop>
+      <d:getetag>"event-etag-gzip"</d:getetag>
+      <c:calendar-data>BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:abc-123
+DTSTART:20260920T060000Z
+DTEND:20260920T070000Z
+SUMMARY:Standup
+END:VEVENT
+END:VCALENDAR
+</c:calendar-data>
+    </d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat>
+  </d:response>
+</d:multistatus>"""
+
+
+def test_list_events_in_one_calendar_parses_the_report_response():
+    response = FakeResponse(body=EVENT_REPORT_MULTISTATUS.encode("utf-8"))
+
+    payload, record = run_webdav(
+        lambda: main.list_events(webdav_auth(), calendar="personal"), response
+    )
+
+    assert record["method"] == "REPORT"
+    assert payload["calendars_searched"] == ["personal"]
+    assert payload["total_matches"] == 1
+    event = payload["events"][0]
+    assert event["path"] == "abc-123.ics"
+    assert event["uid"] == "abc-123"
+    assert event["summary"] == "Standup"
+    # The compressed-response ETag quirk found for WebDAV applies to any GET,
+    # so the same normalisation is reused here.
+    assert event["etag"] == '"event-etag"'
+
+
+def test_list_events_defaults_to_a_bounded_time_range():
+    response = FakeResponse(body="""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"/>""".encode("utf-8"))
+
+    _, record = run_webdav(lambda: main.list_events(webdav_auth(), calendar="personal"), response)
+
+    assert "time-range" in record["content"]
+
+
+def test_list_events_all_time_omits_the_time_range_filter():
+    response = FakeResponse(body="""<?xml version="1.0"?><d:multistatus xmlns:d="DAV:"/>""".encode("utf-8"))
+
+    _, record = run_webdav(
+        lambda: main.list_events(webdav_auth(), calendar="personal", all_time=True), response
+    )
+
+    assert "time-range" not in record["content"]
+
+
+def test_list_events_without_a_calendar_searches_every_calendar_found():
+    """Omitting `calendar` first lists calendars, then REPORTs each one - two
+    network calls, and the second must use the id the first one returned."""
+    calendars_response = FakeResponse(body=CALENDAR_LIST_MULTISTATUS.encode("utf-8"))
+    events_response = FakeResponse(body=EVENT_REPORT_MULTISTATUS.encode("utf-8"))
+
+    payload, record = run_webdav(
+        lambda: main.list_events(webdav_auth()), [calendars_response, events_response, events_response]
+    )
+
+    assert payload["calendars_searched"] == ["personal", "shared"]
+    assert payload["total_matches"] == 2  # one event found per calendar
+
+
+def test_get_event_reports_missing_events_by_path():
+    response = FakeResponse(status_code=404)
+
+    payload, _ = run_webdav(
+        lambda: main.get_event(webdav_auth(), "personal", "missing.ics"), response
+    )
+
+    assert payload["ok"] is False
+    assert "missing.ics" in payload["error"]
+
+
+def test_get_event_parses_a_single_vevent_and_carries_the_etag():
+    ics = (
+        "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:abc-123\r\n"
+        "DTSTART:20260920T060000Z\r\nDTEND:20260920T070000Z\r\nSUMMARY:Standup\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    response = FakeResponse(headers={"etag": '"e1"'}, body=ics.encode("utf-8"))
+
+    payload, record = run_webdav(
+        lambda: main.get_event(webdav_auth(), "personal", "abc-123.ics"), response
+    )
+
+    assert record["method"] == "GET"
+    assert payload["ok"] is True
+    assert payload["uid"] == "abc-123"
+    assert payload["etag"] == '"e1"'
+    assert payload["overrides"] == []
+    assert "BEGIN:VEVENT" in payload["raw_ics"]
+
+
+def test_create_event_generates_a_uid_and_refuses_to_overwrite():
+    response = FakeResponse(status_code=201, headers={"etag": '"new"'})
+
+    payload, record = run_webdav(
+        lambda: main.create_event(
+            webdav_auth(), calendar="personal", summary="Standup",
+            start="2026-09-20T09:00:00Z", end="2026-09-20T09:15:00Z",
+        ),
+        response,
+    )
+
+    assert record["method"] == "PUT"
+    assert record["headers"]["If-None-Match"] == "*"
+    assert record["headers"]["Content-Type"] == "text/calendar; charset=utf-8"
+    assert payload["ok"] is True
+    assert payload["path"] == f"{payload['uid']}.ics"
+    import uuid as _uuid
+    _uuid.UUID(payload["uid"])  # generated uid must be a real uuid4
+
+
+def test_create_event_explains_a_uid_collision():
+    response = FakeResponse(status_code=412)
+
+    payload, _ = run_webdav(
+        lambda: main.create_event(
+            webdav_auth(), calendar="personal", summary="Standup",
+            start="2026-09-20T09:00:00Z", end="2026-09-20T09:15:00Z", uid="fixed-uid",
+        ),
+        response,
+    )
+
+    assert payload["ok"] is False
+    assert "already exists" in payload["error"]
+
+
+def test_update_event_requires_calendar_path_and_uid():
+    async def call():
+        await main.update_event(webdav_auth(), summary="x", start="2026-09-20T09:00:00Z")
+
+    try:
+        asyncio.run(call())
+    except ValueError as exc:
+        assert "required" in str(exc)
+    else:
+        raise AssertionError("missing calendar/path/uid was not rejected")
+
+
+def test_update_event_sends_if_match_and_preserves_the_uid():
+    response = FakeResponse(status_code=204, headers={"etag": '"updated"'})
+
+    payload, record = run_webdav(
+        lambda: main.update_event(
+            webdav_auth(), calendar="personal", path="abc-123.ics", uid="abc-123",
+            summary="Standup (moved)", start="2026-09-20T10:00:00Z", end="2026-09-20T10:15:00Z",
+            if_match='"old"',
+        ),
+        response,
+    )
+
+    assert record["headers"]["If-Match"] == '"old"'
+    assert "UID:abc-123" in record["content"].decode("utf-8")
+    assert payload["ok"] is True
+    assert payload["etag"] == '"updated"'
+
+
+def test_update_event_explains_a_precondition_failure():
+    response = FakeResponse(status_code=412)
+
+    payload, _ = run_webdav(
+        lambda: main.update_event(
+            webdav_auth(), calendar="personal", path="abc-123.ics", uid="abc-123",
+            summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
+        ),
+        response,
+    )
+
+    assert payload["ok"] is False
+    assert "caldav_get_event" in payload["error"]
+
+
+def test_delete_event_reports_a_missing_event():
+    response = FakeResponse(status_code=404)
+
+    payload, record = run_webdav(
+        lambda: main.delete_event(webdav_auth(), "personal", "missing.ics"), response
+    )
+
+    assert record["method"] == "DELETE"
+    assert payload["ok"] is False
+    assert "missing.ics" in payload["error"]
+
+
+def test_delete_event_sends_if_match_when_given():
+    response = FakeResponse(status_code=204)
+
+    _, record = run_webdav(
+        lambda: main.delete_event(webdav_auth(), "personal", "abc-123.ics", if_match='"e1"'), response
+    )
+
+    assert record["headers"]["If-Match"] == '"e1"'
+
+
+def test_create_calendar_sends_displayname_and_color():
+    response = FakeResponse(status_code=201)
+
+    _, record = run_webdav(
+        lambda: main.create_calendar(webdav_auth(), calendar="work", display_name="Work", color="#FF0000"),
+        response,
+    )
+
+    assert record["method"] == "MKCALENDAR"
+    body = record["content"]
+    assert "<d:displayname>Work</d:displayname>" in body
+    assert "#FF0000" in body
+
+
+def test_create_calendar_rejects_an_invalid_color():
+    async def call():
+        await main.create_calendar(webdav_auth(), calendar="work", color="not-a-color")
+
+    try:
+        asyncio.run(call())
+    except ValueError as exc:
+        assert "color" in str(exc)
+    else:
+        raise AssertionError("invalid color was not rejected")
+
+
+def test_create_calendar_explains_an_existing_calendar():
+    response = FakeResponse(status_code=405)
+
+    payload, _ = run_webdav(
+        lambda: main.create_calendar(webdav_auth(), calendar="work"), response
+    )
+
+    assert payload["ok"] is False
+    assert "already exists" in payload["error"]
+
+
+def test_delete_calendar_refuses_without_confirm_and_makes_no_request():
+    payload = asyncio.run(main.delete_calendar(webdav_auth(), calendar="work"))
+
+    assert payload["ok"] is False
+    assert "confirm" in payload["error"]
+
+
+def test_delete_calendar_deletes_when_confirmed():
+    response = FakeResponse(status_code=204)
+
+    payload, record = run_webdav(
+        lambda: main.delete_calendar(webdav_auth(), calendar="work", confirm=True), response
+    )
+
+    assert record["method"] == "DELETE"
+    assert payload["ok"] is True
+
+
+def test_caldav_operations_are_in_the_catalogue_not_the_tool_list():
+    listed = run_mcp(lambda client: post_mcp(client, "tools/list"))["result"]
+    assert [t["name"] for t in listed["tools"]] == META_TOOL_NAMES
+
+    found = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.FIND_TOOL_NAME, "arguments": {"app": main.CALDAV_APP_ID}},
+            call_headers(main.FIND_TOOL_NAME),
+        )
+    )["result"]["structuredContent"]
+
+    assert sorted(row["name"] for row in found["operations"]) == [
+        "caldav_create_calendar", "caldav_create_event", "caldav_delete_calendar",
+        "caldav_delete_event", "caldav_get_event", "caldav_list_calendars",
+        "caldav_list_events", "caldav_update_event",
+    ]
+
+
+def test_a_caldav_operation_still_refuses_an_uncredentialed_caller():
+    result = run_mcp(
+        lambda client: post_mcp(
+            client,
+            "tools/call",
+            {"name": main.CALL_TOOL_NAME, "arguments": {"name": "caldav_list_calendars", "arguments": {}}},
+            call_headers(main.CALL_TOOL_NAME, authenticated=False),
+        )
+    )["result"]["structuredContent"]
+
+    assert result["ok"] is False
+    assert "Missing request credentials" in result["error"]
