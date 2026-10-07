@@ -14,12 +14,12 @@ Times need a UTC offset or `Z` - `2026-09-20T14:00:00+08:00`, not a bare local d
 
 **Verified against a live instance (2026-10-07).** All eight operations were run against a real Nextcloud using throwaway calendars: calendar create/list/delete (including the `confirm` guard and the `color` property, which Nextcloud accepted), event create/list/get/update/delete, `if_match` returning 412 on a stale ETag for both update and delete, duplicate `uid` rejection, a recurring event matched correctly inside and outside its `COUNT` window, and listing across every calendar at once. Calendar deletion is still treated as permanent because Nextcloud's calendar trash retention was not checked.
 
-That run turned up four defects, since fixed in code and covered by tests in `test_main.py` (redeploy to pick them up):
+That run turned up four defects, since fixed, covered by tests in `test_main.py`, and re-verified against the redeployed server on the same day:
 - An attendee or organizer `name` containing a comma was returned with a stray backslash (`A\, Alice`). `CN` is a parameter, not TEXT, so it is now double-quoted instead of backslash-escaped, and the parser no longer splits on a `:` or `;` inside quotes.
 - `caldav_update_event` accepted a `uid` that differed from the stored one. It now reads the event first and refuses a mismatch (one extra GET per update).
 - `end` earlier than `start` was accepted; it is now rejected. An `end` equal to `start` is still allowed.
 - An invalid `rrule` came back as a raw 500 XML body from Nextcloud; it is now checked for `FREQ=` plus `NAME=value` parts before anything is sent.
 
-A fifth, cosmetic one is fixed too: updating rewrote the whole object, so `CREATED` became the update time. The original `CREATED` is now carried over from the read that already checks the UID (an event with no `CREATED` is stamped with the update time).
+A fifth, cosmetic one is fixed too: updating rewrote the whole object, so `CREATED` became the update time. The original `CREATED` is now carried over from the read that already checks the UID (an event with no `CREATED` is stamped with the update time). This was re-verified live as well: after an update `CREATED` was unchanged while `LAST-MODIFIED` moved forward.
 
 Not tested: writing to a read-only shared calendar, and recurring events with dated exceptions (`override_count` > 0).
