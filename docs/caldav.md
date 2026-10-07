@@ -12,4 +12,14 @@ Event identity follows the same rule [sabre/dav](https://sabre.io/dav/building-a
 
 Times need a UTC offset or `Z` - `2026-09-20T14:00:00+08:00`, not a bare local datetime - because CalDAV has no notion of which timezone the caller means. Reading back a time the server tagged with an IANA zone (`TZID=Asia/Taipei`) returns the wall-clock value plus that zone name rather than converting it to an absolute instant; this server does not parse `VTIMEZONE` tables, so treat a returned event's `timezone` field as informational.
 
-**Not verified against a live instance.** Unlike WebDAV - which surfaced three real quirks only visible against a running Nextcloud (see [WebDAV](webdav.md)) - the CalDAV operations were built from RFC 4791/5545 and sabre/dav's own documentation, and exercised only against synthetic fixtures in `test_main.py`. Validate against a real calendar before relying on them, especially `caldav_create_calendar`'s `color` property (an Apple/CalendarServer extension, not part of RFC 4791, that most servers including Nextcloud accept but nothing guarantees) and calendar deletion, which is treated as permanent here because this server has not confirmed whether Nextcloud's calendar trash retention actually catches it.
+**Verified against a live instance (2026-10-07).** All eight operations were run against a real Nextcloud using throwaway calendars: calendar create/list/delete (including the `confirm` guard and the `color` property, which Nextcloud accepted), event create/list/get/update/delete, `if_match` returning 412 on a stale ETag for both update and delete, duplicate `uid` rejection, a recurring event matched correctly inside and outside its `COUNT` window, and listing across every calendar at once. Calendar deletion is still treated as permanent because Nextcloud's calendar trash retention was not checked.
+
+That run turned up four defects, since fixed in code and covered by tests in `test_main.py` (redeploy to pick them up):
+- An attendee or organizer `name` containing a comma was returned with a stray backslash (`A\, Alice`). `CN` is a parameter, not TEXT, so it is now double-quoted instead of backslash-escaped, and the parser no longer splits on a `:` or `;` inside quotes.
+- `caldav_update_event` accepted a `uid` that differed from the stored one. It now reads the event first and refuses a mismatch (one extra GET per update).
+- `end` earlier than `start` was accepted; it is now rejected. An `end` equal to `start` is still allowed.
+- An invalid `rrule` came back as a raw 500 XML body from Nextcloud; it is now checked for `FREQ=` plus `NAME=value` parts before anything is sent.
+
+A fifth, cosmetic one is fixed too: updating rewrote the whole object, so `CREATED` became the update time. The original `CREATED` is now carried over from the read that already checks the UID (an event with no `CREATED` is stamped with the update time).
+
+Not tested: writing to a read-only shared calendar, and recurring events with dated exceptions (`override_count` > 0).

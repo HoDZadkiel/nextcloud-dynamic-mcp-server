@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import os
+import re
 import time
 
 # Port 9 (discard) refuses instantly, so the startup discovery the server
@@ -1705,8 +1706,19 @@ def test_update_event_requires_calendar_path_and_uid():
         raise AssertionError("missing calendar/path/uid was not rejected")
 
 
+def stored_event(uid="abc-123", created=None):
+    """What `update_event` reads back first to confirm the UID it was given."""
+    created_line = f"CREATED:{created}\r\n" if created else ""
+    ics = (
+        f"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:{uid}\r\n{created_line}"
+        "DTSTART:20260920T060000Z\r\nDTEND:20260920T070000Z\r\nSUMMARY:Standup\r\n"
+        "END:VEVENT\r\nEND:VCALENDAR\r\n"
+    )
+    return FakeResponse(headers={"etag": '"old"'}, body=ics.encode("utf-8"))
+
+
 def test_update_event_sends_if_match_and_preserves_the_uid():
-    response = FakeResponse(status_code=204, headers={"etag": '"updated"'})
+    put = FakeResponse(status_code=204, headers={"etag": '"updated"'})
 
     payload, record = run_webdav(
         lambda: main.update_event(
@@ -1714,28 +1726,167 @@ def test_update_event_sends_if_match_and_preserves_the_uid():
             summary="Standup (moved)", start="2026-09-20T10:00:00Z", end="2026-09-20T10:15:00Z",
             if_match='"old"',
         ),
-        response,
+        [stored_event(), put],
     )
 
-    assert record["headers"]["If-Match"] == '"old"'
-    assert "UID:abc-123" in record["content"].decode("utf-8")
+    sent = record["calls"][1]
+    assert sent["method"] == "PUT"
+    assert sent["headers"]["If-Match"] == '"old"'
+    assert "UID:abc-123" in sent["content"].decode("utf-8")
     assert payload["ok"] is True
     assert payload["etag"] == '"updated"'
 
 
 def test_update_event_explains_a_precondition_failure():
-    response = FakeResponse(status_code=412)
-
     payload, _ = run_webdav(
         lambda: main.update_event(
             webdav_auth(), calendar="personal", path="abc-123.ics", uid="abc-123",
             summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
         ),
-        response,
+        [stored_event(), FakeResponse(status_code=412)],
     )
 
     assert payload["ok"] is False
     assert "caldav_get_event" in payload["error"]
+
+
+def test_update_event_keeps_the_original_created_time():
+    """An update is a full replace, but the event was not created again - CREATED
+    must survive it while LAST-MODIFIED moves forward."""
+    _, record = run_webdav(
+        lambda: main.update_event(
+            webdav_auth(), calendar="personal", path="abc-123.ics", uid="abc-123",
+            summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
+        ),
+        [stored_event(created="20250101T080000Z"), FakeResponse(status_code=204)],
+    )
+
+    sent = record["calls"][1]["content"].decode("utf-8")
+    assert "CREATED:20250101T080000Z" in sent
+    assert "LAST-MODIFIED:20250101T080000Z" not in sent
+
+
+def test_update_event_stamps_created_now_when_the_stored_event_has_none():
+    _, record = run_webdav(
+        lambda: main.update_event(
+            webdav_auth(), calendar="personal", path="abc-123.ics", uid="abc-123",
+            summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
+        ),
+        [stored_event(), FakeResponse(status_code=204)],
+    )
+
+    sent = record["calls"][1]["content"].decode("utf-8")
+    created = re.search(r"CREATED:(\d{8}T\d{6}Z)", sent)
+    modified = re.search(r"LAST-MODIFIED:(\d{8}T\d{6}Z)", sent)
+    assert created and modified and created.group(1) == modified.group(1)
+
+
+def test_build_vevent_ics_ignores_an_unparsable_created_value():
+    ics = main.build_vevent_ics(
+        "uid", {"summary": "x", "start": "2026-09-20"}, created="not-a-timestamp"
+    )
+    assert re.search(r"CREATED:\d{8}T\d{6}Z", ics)
+
+
+def test_update_event_rejects_a_uid_that_differs_from_the_stored_one():
+    """A different UID would make the replaced object a different event to every
+    other CalDAV client, so the PUT must never be sent."""
+    async def call():
+        await main.update_event(
+            webdav_auth(), calendar="personal", path="abc-123.ics", uid="someone-else",
+            summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
+        )
+
+    calls = []
+    original = main.httpx2.AsyncClient
+    main.httpx2.AsyncClient = lambda **_: FakeClient([stored_event()], calls)
+    try:
+        asyncio.run(call())
+    except ValueError as exc:
+        assert "does not match" in str(exc)
+    else:
+        raise AssertionError("a mismatched uid was not rejected")
+    finally:
+        main.httpx2.AsyncClient = original
+
+    assert [call["method"] for call in calls] == ["GET"]
+
+
+def test_update_event_reports_a_missing_event_without_putting():
+    payload, record = run_webdav(
+        lambda: main.update_event(
+            webdav_auth(), calendar="personal", path="gone.ics", uid="abc-123",
+            summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
+        ),
+        FakeResponse(status_code=404),
+    )
+
+    assert payload["ok"] is False
+    assert "No event" in payload["error"]
+    assert [call["method"] for call in record["calls"]] == ["GET"]
+
+
+def test_build_vevent_ics_rejects_an_end_earlier_than_the_start():
+    for fields in (
+        {"start": "2026-09-20T10:00:00Z", "end": "2026-09-20T09:00:00Z"},
+        {"start": "2026-09-20", "end": "2026-09-19"},
+        # An offset that puts `end` earlier in UTC even though its wall clock is later.
+        {"start": "2026-09-20T10:00:00Z", "end": "2026-09-20T12:00:00+08:00"},
+    ):
+        try:
+            main.build_vevent_ics("uid", {"summary": "x", **fields})
+        except ValueError as exc:
+            assert "earlier" in str(exc)
+        else:
+            raise AssertionError(f"end before start was not rejected: {fields}")
+
+
+def test_build_vevent_ics_allows_an_end_equal_to_the_start():
+    ics = main.build_vevent_ics(
+        "uid", {"summary": "x", "start": "2026-09-20T10:00:00Z", "end": "2026-09-20T10:00:00Z"}
+    )
+    assert "DTEND:20260920T100000Z" in ics
+
+
+def test_build_vevent_ics_rejects_a_malformed_rrule_before_it_reaches_the_server():
+    for rrule in ("EVERY TUESDAY", "COUNT=5", "FREQ=", "FREQ=WEEKLY;COUNT"):
+        try:
+            main.build_vevent_ics(
+                "uid", {"summary": "x", "start": "2026-09-20", "rrule": rrule}
+            )
+        except ValueError as exc:
+            assert "rrule" in str(exc)
+        else:
+            raise AssertionError(f"malformed rrule was not rejected: {rrule!r}")
+
+
+def test_build_vevent_ics_accepts_real_world_rrules():
+    for rrule in ("FREQ=DAILY;COUNT=3", "FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10", "FREQ=MONTHLY;BYMONTHDAY=-1;UNTIL=20271231T000000Z"):
+        ics = main.build_vevent_ics("uid", {"summary": "x", "start": "2026-09-20", "rrule": rrule})
+        assert f"RRULE:{rrule}" in ics
+
+
+def test_attendee_and_organizer_names_with_punctuation_round_trip_without_a_backslash():
+    """CN is a parameter, not TEXT: backslash-escaping a comma there left a literal
+    `\\,` in the name when it was read back."""
+    fields = dict(
+        summary="x", start="2026-09-20T09:00:00Z", end="2026-09-20T10:00:00Z",
+        organizer_email="o@example.com", organizer_name="Org; Anizer: Ltd",
+        attendees=[{"email": "a@example.com", "name": "Alice, A."}, {"email": "b@example.com", "name": 'Bob "B"'}],
+    )
+    ics = main.build_vevent_ics("uid", fields)
+    assert 'ATTENDEE;CN="Alice, A.":mailto:a@example.com' in ics
+    assert "\\," not in ics.split("ATTENDEE", 1)[1]
+
+    parsed = main.parse_vevent_block(main.extract_blocks(main.unfold_ical_lines(ics), "VEVENT")[0])
+    assert parsed["organizer"] == {"email": "o@example.com", "name": "Org; Anizer: Ltd"}
+    assert parsed["attendees"][0] == {"email": "a@example.com", "name": "Alice, A."}
+    assert parsed["attendees"][1] == {"email": "b@example.com", "name": "Bob B"}
+
+
+def test_parse_ical_property_splits_on_a_colon_outside_quotes_only():
+    name, params, value = main.parse_ical_property('ATTENDEE;CN="A: B; C":mailto:a@example.com')
+    assert (name, params, value) == ("ATTENDEE", {"CN": "A: B; C"}, "mailto:a@example.com")
 
 
 def test_delete_event_reports_a_missing_event():

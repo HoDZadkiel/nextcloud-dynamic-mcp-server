@@ -7,7 +7,7 @@ At startup the server reads the OpenAPI description of every installed app from 
 Speaks MCP protocol revision `2026-07-28`, and still answers older handshake revisions.
 
 > [!WARNING]
-> The CalDAV calendar operations have **not** been run against a live Nextcloud, and most write operations (`POST`/`PUT`/`DELETE`) in the catalogue are untested. Try them on a test instance first. See [Known limitations](#known-limitations).
+> The CalDAV operations have been exercised against a live Nextcloud, but most other write operations (`POST`/`PUT`/`DELETE`) in the catalogue are untested. Try them on a test instance first. See [Known limitations](#known-limitations).
 
 This is a fork of [Rello/nextcloud-dynamic-mcp-server](https://github.com/Rello/nextcloud-dynamic-mcp-server); see [Attribution](#attribution).
 
@@ -92,12 +92,12 @@ Call `nextcloud_discovery_status` from your client and check the app list matche
 
 Four tools, whatever the instance has installed:
 
-| Tool | Purpose |
-|---|---|
-| `nextcloud_find_operations` | Search the catalogue by free text and/or app id. |
-| `nextcloud_describe_operations` | Full JSON Schema for one or more operations. |
-| `nextcloud_call_operation` | Run one operation by name with an `arguments` object. |
-| `nextcloud_discovery_status` | Auth mode, operation count, last refresh. With credentials: instance URL, app inventory, raw error. `{"refresh": true}` re-runs discovery. |
+| Tool                            | Purpose                                                                                                                                    |
+|---------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------|
+| `nextcloud_find_operations`     | Search the catalogue by free text and/or app id.                                                                                           |
+| `nextcloud_describe_operations` | Full JSON Schema for one or more operations.                                                                                               |
+| `nextcloud_call_operation`      | Run one operation by name with an `arguments` object.                                                                                      |
+| `nextcloud_discovery_status`    | Auth mode, operation count, last refresh. With credentials: instance URL, app inventory, raw error. `{"refresh": true}` re-runs discovery. |
 
 Typical flow: **find → describe → call**. A wrong or near-miss operation name returns a `did_you_mean` list instead of failing.
 
@@ -109,8 +109,8 @@ Every tool except `nextcloud_discovery_status` requires the caller's credentials
 
 OCS discovery cannot read file contents or touch calendars, so the catalogue also contains hand-written operations that run with the caller's own credentials:
 
-- **`webdav_*`** (5 operations) - read, write, list, create folder, delete files. Details: [docs/webdav.md](docs/webdav.md)
-- **`caldav_*`** (8 operations) - list/create/delete calendars; list/get/create/update/delete events. Details: [docs/caldav.md](docs/caldav.md)
+- `webdav_*` (5 operations) - read, write, list, create folder, delete files. Details: [docs/webdav.md](docs/webdav.md)
+- `caldav_*` (8 operations) - list/create/delete calendars; list/get/create/update/delete events. Details: [docs/caldav.md](docs/caldav.md)
 
 ### Why a catalogue instead of one tool per operation
 
@@ -120,27 +120,27 @@ Publishing ~545 tools costs ~101,000 tokens of context per session (measured: 40
 
 All settings are environment variables.
 
-| Variable | Default | Description |
-|---|---|---|
-| `NEXTCLOUD_URL` | `http://nc31-app-1:80` | Base URL of your Nextcloud. **Always set this** - the default is only a placeholder. |
-| `NEXTCLOUD_USERNAME` | unset | Account for startup discovery (and for `stdio` execution) |
-| `NEXTCLOUD_APP_TOKEN` | unset | App token for the above |
-| `MCP_TRANSPORT` | `streamable-http` | `streamable-http` or `stdio` |
-| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | Bind address for HTTP mode |
-| `DISCOVERY_TIMEOUT_SECONDS` | `30` | Timeout for discovery and proxied requests |
-| `DISCOVERY_RETRY_SECONDS` | `60` | How long a failed discovery is cached before retrying |
-| `TOOL_LIST_TTL_MS` | `300000` | `ttlMs` cache hint on `tools/list` |
-| `CORS_ALLOW_ORIGINS` | unset | Comma-separated origins for **browser-based** clients (`*` allows all). CLI and native clients ignore CORS. |
-| `LOG_LEVEL` | `INFO` | Python log level |
-| `DEBUG` | unset | `true` enables Starlette debug mode |
+| Variable                    | Default                | Description                                                                                                 |
+|-----------------------------|------------------------|-------------------------------------------------------------------------------------------------------------|
+| `NEXTCLOUD_URL`             | `http://nc31-app-1:80` | Base URL of your Nextcloud. **Always set this** - the default is only a placeholder.                        |
+| `NEXTCLOUD_USERNAME`        | unset                  | Account for startup discovery (and for `stdio` execution)                                                   |
+| `NEXTCLOUD_APP_TOKEN`       | unset                  | App token for the above                                                                                     |
+| `MCP_TRANSPORT`             | `streamable-http`      | `streamable-http` or `stdio`                                                                                |
+| `MCP_HOST` / `MCP_PORT`     | `0.0.0.0` / `8000`     | Bind address for HTTP mode                                                                                  |
+| `DISCOVERY_TIMEOUT_SECONDS` | `30`                   | Timeout for discovery and proxied requests                                                                  |
+| `DISCOVERY_RETRY_SECONDS`   | `60`                   | How long a failed discovery is cached before retrying                                                       |
+| `TOOL_LIST_TTL_MS`          | `300000`               | `ttlMs` cache hint on `tools/list`                                                                          |
+| `CORS_ALLOW_ORIGINS`        | unset                  | Comma-separated origins for **browser-based** clients (`*` allows all). CLI and native clients ignore CORS. |
+| `LOG_LEVEL`                 | `INFO`                 | Python log level                                                                                            |
+| `DEBUG`                     | unset                  | `true` enables Starlette debug mode                                                                         |
 
 ## Authentication
 
-| Path | Credentials | Used for |
-|---|---|---|
-| Discovery | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Reading the API catalogue at startup |
-| Execution (HTTP) | `X-Nextcloud-Username` / `X-Nextcloud-AppToken` headers | Every proxied call |
-| Execution (stdio) | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Every proxied call |
+| Path              | Credentials                                             | Used for                             |
+|-------------------|---------------------------------------------------------|--------------------------------------|
+| Discovery         | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN`            | Reading the API catalogue at startup |
+| Execution (HTTP)  | `X-Nextcloud-Username` / `X-Nextcloud-AppToken` headers | Every proxied call                   |
+| Execution (stdio) | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN`            | Every proxied call                   |
 
 - Over HTTP the server **never** falls back to the discovery account for execution, so callers cannot act as each other.
 - `find`, `describe`, `call` and the detailed `status` all reject uncredentialed callers, because the catalogue reveals installed apps and API paths. `tools/list` stays open (clients need it to connect) but shows only fixed tool names.
@@ -158,18 +158,19 @@ Apps whose document fails to load are skipped with a warning. If discovery fails
 
 ## Troubleshooting
 
-| Symptom | Likely cause |
-|---|---|
+| Symptom                                           | Likely cause                                                                                                                                |
+|---------------------------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------|
 | `nextcloud_discovery_status` reports 0 operations | `ocs_api_viewer` not enabled, wrong `NEXTCLOUD_URL`, or bad discovery credentials. Check the status error and `docker compose logs -f mcp`. |
-| Tool call rejected for missing credentials | Client isn't sending `X-Nextcloud-Username` / `X-Nextcloud-AppToken`. |
-| `docker compose up` fails on network `testnet` | Run `docker network create testnet`, or remove the `networks:` entries. |
-| Container can't reach Nextcloud | `NEXTCLOUD_URL` must be reachable from inside the container (not `localhost`; try `http://host.docker.internal:<port>`). |
-| Browser client blocked | Set `CORS_ALLOW_ORIGINS`. |
+| Tool call rejected for missing credentials        | Client isn't sending `X-Nextcloud-Username` / `X-Nextcloud-AppToken`.                                                                       |
+| `docker compose up` fails on network `testnet`    | Run `docker network create testnet`, or remove the `networks:` entries.                                                                     |
+| Container can't reach Nextcloud                   | `NEXTCLOUD_URL` must be reachable from inside the container (not `localhost`; try `http://host.docker.internal:<port>`).                    |
+| Browser client blocked                            | Set `CORS_ALLOW_ORIGINS`.                                                                                                                   |
 
 ## Known limitations
 
-- CalDAV operations are untested against a live Nextcloud, handle `VEVENT` only, and don't parse `VTIMEZONE`.
-- Most `POST`/`PUT`/`DELETE` operations in the catalogue are untested.
+- CalDAV operations were verified against a live Nextcloud (create/list/get/update/delete for calendars and events, ETag guards, recurring-event windows, cross-calendar listing). They handle `VEVENT` only and don't parse `VTIMEZONE`; event times are returned in UTC.
+- Writes to read-only shared calendars, and dated recurrence exceptions (`override_count` > 0), have not been tested.
+- Most other `POST`/`PUT`/`DELETE` operations in the catalogue are untested.
 - Proxying against a real instance is not covered by the automated tests.
 
 ## Tests

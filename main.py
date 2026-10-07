@@ -1402,11 +1402,38 @@ def unfold_ical_lines(text: str) -> list[str]:
     return lines
 
 
+def ical_param_value(value: str) -> str:
+    """RFC 5545 §3.2 parameter values are not TEXT: a backslash is not an escape
+    here, so `ical_escape_text` would leave a literal `\\,` behind. A value with
+    `,` `;` or `:` is double-quoted instead, and a `"` (which cannot appear at
+    all) or line break is dropped."""
+    cleaned = re.sub(r'["\r\n]', "", str(value))
+    return f'"{cleaned}"' if re.search(r"[,;:]", cleaned) else cleaned
+
+
+def split_outside_quotes(text: str, separator: str, maxsplit: int = -1) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    in_quotes = False
+    for char in text:
+        if char == '"':
+            in_quotes = not in_quotes
+        if char == separator and not in_quotes and maxsplit != 0:
+            parts.append("".join(current))
+            current = []
+            maxsplit -= 1
+            continue
+        current.append(char)
+    parts.append("".join(current))
+    return parts
+
+
 def parse_ical_property(line: str) -> tuple[str, dict[str, str], str]:
-    if ":" not in line:
+    split = split_outside_quotes(line, ":", 1)
+    if len(split) < 2:
         return line.upper(), {}, ""
-    head, value = line.split(":", 1)
-    parts = head.split(";")
+    head, value = split
+    parts = split_outside_quotes(head, ";")
     params: dict[str, str] = {}
     for part in parts[1:]:
         key, _, val = part.partition("=")
@@ -1566,11 +1593,13 @@ def parse_vevent_block(lines: list[str]) -> dict[str, Any]:
     }
 
 
-def build_vevent_ics(uid: str, fields: dict[str, Any]) -> str:
+def build_vevent_ics(uid: str, fields: dict[str, Any], created: str | None = None) -> str:
     """Build a complete VCALENDAR/VEVENT. Always a full document, never a
     patch - `caldav_update_event` is a full replace for the same reason
     `webdav_write_file` is, so there is exactly one code path that has to get
-    the iCalendar syntax right."""
+    the iCalendar syntax right. `created` carries the original creation time
+    (an ISO string, as `parse_utc_ical_timestamp` returns it) through an update;
+    without it, or if it does not parse, the event is stamped as created now."""
     summary = fields.get("summary")
     if not summary:
         raise ValueError("`summary` is required")
@@ -1580,6 +1609,12 @@ def build_vevent_ics(uid: str, fields: dict[str, Any]) -> str:
 
     now = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     start_value, start_is_date = encode_ical_datetime(start, "start")
+    created_value = now
+    if created:
+        try:
+            created_value = datetime.fromisoformat(created).astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        except ValueError:
+            pass
 
     lines = [
         "BEGIN:VCALENDAR",
@@ -1588,7 +1623,7 @@ def build_vevent_ics(uid: str, fields: dict[str, Any]) -> str:
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{now}",
-        f"CREATED:{now}",
+        f"CREATED:{created_value}",
         f"LAST-MODIFIED:{now}",
         "SEQUENCE:0",
         f"DTSTART{';VALUE=DATE' if start_is_date else ''}:{start_value}",
@@ -1599,6 +1634,8 @@ def build_vevent_ics(uid: str, fields: dict[str, Any]) -> str:
         end_value, end_is_date = encode_ical_datetime(end, "end")
         if end_is_date != start_is_date:
             raise ValueError("`start` and `end` must both be `YYYY-MM-DD` dates or both be datetimes")
+        if end_value < start_value:  # same format on both sides, so string order is time order
+            raise ValueError("`end` must not be earlier than `start`")
         lines.append(f"DTEND{';VALUE=DATE' if end_is_date else ''}:{end_value}")
     elif not start_is_date:
         raise ValueError("`end` is required for a timed event - only an all-day event may omit it")
@@ -1622,16 +1659,21 @@ def build_vevent_ics(uid: str, fields: dict[str, Any]) -> str:
                 "`rrule` must be a single RFC 5545 value with no colon or newline, "
                 "e.g. `FREQ=WEEKLY;COUNT=10`"
             )
+        if not re.fullmatch(r"FREQ=[A-Za-z]+(;[A-Za-z-]+=[^;]+)*", rrule):
+            raise ValueError(
+                f"`rrule` is not a valid RFC 5545 recurrence rule: {rrule!r}. It must start with "
+                "`FREQ=` followed by `NAME=value` parts, e.g. `FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10`"
+            )
         lines.append(f"RRULE:{rrule}")
     if fields.get("organizer_email"):
-        cn = f";CN={ical_escape_text(fields['organizer_name'])}" if fields.get("organizer_name") else ""
+        cn = f";CN={ical_param_value(fields['organizer_name'])}" if fields.get("organizer_name") else ""
         lines.append(f"ORGANIZER{cn}:mailto:{fields['organizer_email']}")
     for attendee in fields.get("attendees") or []:
         email = (attendee or {}).get("email")
         if not email:
             raise ValueError("Every entry in `attendees` needs an `email`")
         name = attendee.get("name")
-        cn = f";CN={ical_escape_text(name)}" if name else ""
+        cn = f";CN={ical_param_value(name)}" if name else ""
         lines.append(f"ATTENDEE{cn}:mailto:{email}")
     for minutes in fields.get("reminders_minutes_before") or []:
         try:
@@ -2010,7 +2052,18 @@ async def update_event(
         status=status, categories=categories, rrule=rrule, organizer_email=organizer_email,
         organizer_name=organizer_name, attendees=attendees, reminders_minutes_before=reminders_minutes_before,
     )
-    ics = build_vevent_ics(uid, fields)
+    # A different UID would turn this into another event to every other CalDAV
+    # client, so compare against what is stored before the PUT replaces it.
+    existing = await get_event(auth_context, calendar, path)
+    if not existing["ok"]:
+        return existing
+    if existing["uid"] != uid:
+        raise ValueError(
+            f"`uid` {uid!r} does not match the stored event's UID {existing['uid']!r}; "
+            "pass the `uid` that `caldav_get_event` returned"
+        )
+    ics = build_vevent_ics(uid, fields, created=existing.get("created"))
+
     url = caldav_object_url(auth_context, calendar, path)
     extra_headers = {"Content-Type": "text/calendar; charset=utf-8"}
     if if_match:
