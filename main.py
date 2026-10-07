@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote, unquote
 from xml.etree import ElementTree
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx2
 import mcp.server.stdio
@@ -44,6 +45,9 @@ MCP_TRANSPORT = os.getenv("MCP_TRANSPORT", "streamable-http")
 DISCOVERY_TIMEOUT_SECONDS = float(os.getenv("DISCOVERY_TIMEOUT_SECONDS", "30"))
 DISCOVERY_RETRY_SECONDS = float(os.getenv("DISCOVERY_RETRY_SECONDS", "60"))
 TOOL_LIST_TTL_MS = int(os.getenv("TOOL_LIST_TTL_MS", "300000"))
+# IANA zone (e.g. `Asia/Taipei`) that CalDAV events are written in when a call passes no
+# `timezone` of its own. Unset keeps the original behaviour: everything is stored as UTC.
+CALDAV_DEFAULT_TIMEZONE = os.getenv("CALDAV_DEFAULT_TIMEZONE") or None
 CORS_ALLOW_ORIGINS = [
     origin.strip()
     for origin in os.getenv("CORS_ALLOW_ORIGINS", "").split(",")
@@ -1507,6 +1511,49 @@ def encode_ical_datetime(value: Any, field: str) -> tuple[str, bool]:
     return parsed.astimezone(timezone.utc).strftime("%Y%m%dT%H%M%SZ"), False
 
 
+def resolve_event_timezone(name: str | None) -> ZoneInfo | None:
+    zone_name = name or CALDAV_DEFAULT_TIMEZONE
+    if not zone_name:
+        return None
+    try:
+        return ZoneInfo(str(zone_name))
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"`timezone` {zone_name!r} is not a known IANA timezone, e.g. `Asia/Taipei`") from exc
+
+
+def format_utc_offset(delta: Any) -> str:
+    minutes = int(delta.total_seconds() // 60)
+    sign = "-" if minutes < 0 else "+"
+    hours, rest = divmod(abs(minutes), 60)
+    return f"{sign}{hours:02d}{rest:02d}"
+
+
+def localize_ical_datetime(utc_value: str, zone: ZoneInfo) -> tuple[str, Any]:
+    """Turn an encoded UTC `YYYYMMDDTHHMMSSZ` into the zone's wall-clock
+    `YYYYMMDDTHHMMSS`, and also return the UTC offset that applied at that instant."""
+    instant = datetime.strptime(utc_value, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).astimezone(zone)
+    return instant.strftime("%Y%m%dT%H%M%S"), instant.utcoffset()
+
+
+def build_vtimezone(zone_name: str, offset: Any) -> list[str]:
+    """A VTIMEZONE with the single offset in force at the event's start. Clients that
+    know the IANA name resolve `TZID` from their own tz database; this block is what
+    RFC 5545 requires for the rest. It carries no DST rules, so a recurring event in a
+    DST zone is only exact for clients that use their own tz data."""
+    stamp = format_utc_offset(offset)
+    return [
+        "BEGIN:VTIMEZONE",
+        f"TZID:{zone_name}",
+        "BEGIN:STANDARD",
+        "DTSTART:19700101T000000",
+        f"TZOFFSETFROM:{stamp}",
+        f"TZOFFSETTO:{stamp}",
+        f"TZNAME:{zone_name}",
+        "END:STANDARD",
+        "END:VTIMEZONE",
+    ]
+
+
 def decode_ical_datetime(value: str, params: dict[str, str]) -> dict[str, Any] | None:
     """The inverse of `encode_ical_datetime`, plus the cases a server can hand
     back that a caller never sends: a `TZID`-qualified or floating local time,
@@ -1616,17 +1663,32 @@ def build_vevent_ics(uid: str, fields: dict[str, Any], created: str | None = Non
         except ValueError:
             pass
 
+    zone = resolve_event_timezone(fields.get("timezone"))
+    zone_name = str(fields.get("timezone") or CALDAV_DEFAULT_TIMEZONE) if zone else None
+    timed_zone = zone if (zone and not start_is_date) else None
+
+    def dt_line(label: str, value: str, is_date: bool) -> tuple[str, Any]:
+        if is_date:
+            return f"{label};VALUE=DATE:{value}", None
+        if timed_zone is None:
+            return f"{label}:{value}", None
+        local, offset = localize_ical_datetime(value, timed_zone)
+        return f"{label};TZID={zone_name}:{local}", offset
+
+    start_line, start_offset = dt_line("DTSTART", start_value, start_is_date)
+
     lines = [
         "BEGIN:VCALENDAR",
         "VERSION:2.0",
         "PRODID:-//nextcloud-dynamic-mcp-server-fork//caldav//EN",
+        *(build_vtimezone(zone_name, start_offset) if start_offset is not None else []),
         "BEGIN:VEVENT",
         f"UID:{uid}",
         f"DTSTAMP:{now}",
         f"CREATED:{created_value}",
         f"LAST-MODIFIED:{now}",
         "SEQUENCE:0",
-        f"DTSTART{';VALUE=DATE' if start_is_date else ''}:{start_value}",
+        start_line,
     ]
 
     end = fields.get("end")
@@ -1636,7 +1698,7 @@ def build_vevent_ics(uid: str, fields: dict[str, Any], created: str | None = Non
             raise ValueError("`start` and `end` must both be `YYYY-MM-DD` dates or both be datetimes")
         if end_value < start_value:  # same format on both sides, so string order is time order
             raise ValueError("`end` must not be earlier than `start`")
-        lines.append(f"DTEND{';VALUE=DATE' if end_is_date else ''}:{end_value}")
+        lines.append(dt_line("DTEND", end_value, end_is_date)[0])
     elif not start_is_date:
         raise ValueError("`end` is required for a timed event - only an all-day event may omit it")
 
@@ -1989,6 +2051,7 @@ async def create_event(
     attendees: list[Any] = None,
     reminders_minutes_before: list[Any] = None,
     uid: str = None,
+    timezone: str = None,
 ) -> dict[str, Any]:
     if not calendar:
         raise ValueError("`calendar` is required")
@@ -1996,6 +2059,7 @@ async def create_event(
         summary=summary, start=start, end=end, description=description, location=location,
         status=status, categories=categories, rrule=rrule, organizer_email=organizer_email,
         organizer_name=organizer_name, attendees=attendees, reminders_minutes_before=reminders_minutes_before,
+        timezone=timezone,
     )
     event_uid = str(uid) if uid else str(uuid.uuid4())
     ics = build_vevent_ics(event_uid, fields)
@@ -2044,6 +2108,7 @@ async def update_event(
     attendees: list[Any] = None,
     reminders_minutes_before: list[Any] = None,
     if_match: str = None,
+    timezone: str = None,
 ) -> dict[str, Any]:
     if not calendar or not path or not uid:
         raise ValueError("`calendar`, `path` and `uid` are required")
@@ -2051,6 +2116,7 @@ async def update_event(
         summary=summary, start=start, end=end, description=description, location=location,
         status=status, categories=categories, rrule=rrule, organizer_email=organizer_email,
         organizer_name=organizer_name, attendees=attendees, reminders_minutes_before=reminders_minutes_before,
+        timezone=timezone,
     )
     # A different UID would turn this into another event to every other CalDAV
     # client, so compare against what is stored before the PUT replaces it.
@@ -2257,6 +2323,14 @@ CALDAV_EVENT_OPTIONAL_FIELDS: dict[str, Any] = {
         "type": "string",
         "description": "Raw RFC 5545 recurrence rule value, e.g. `FREQ=WEEKLY;BYDAY=MO,WE;COUNT=10`. "
                        "Passed through as-is - not translated from natural language.",
+    },
+    "timezone": {
+        "type": "string",
+        "description": "IANA timezone to store the event in, e.g. `Asia/Taipei`. The instant given in "
+                       "`start`/`end` is unchanged; it is written as that zone's local time with a "
+                       "`TZID`, so calendar clients show the event in that zone instead of as UTC. "
+                       "Defaults to the server's `CALDAV_DEFAULT_TIMEZONE`, or UTC if that is unset. "
+                       "Ignored for all-day events.",
     },
     "organizer_email": {"type": "string"},
     "organizer_name": {"type": "string"},

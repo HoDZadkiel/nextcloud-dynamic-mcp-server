@@ -2,3 +2,4 @@ httpx2>=2.5,<3
 mcp>=2,<3
 starlette>=1,<2
 uvicorn>=0.30,<1
+tzdata

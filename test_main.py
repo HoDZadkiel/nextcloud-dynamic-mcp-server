@@ -1750,6 +1750,87 @@ def test_update_event_explains_a_precondition_failure():
     assert "caldav_get_event" in payload["error"]
 
 
+TAIPEI_FIELDS = dict(
+    summary="x", start="2026-10-06T10:00:00+08:00", end="2026-10-06T12:00:00+08:00", timezone="Asia/Taipei"
+)
+
+
+def test_build_vevent_ics_writes_a_named_timezone_instead_of_utc():
+    """Stored as UTC, a client shows the event's own zone as UTC and it reads as if it
+    happened in UTC+0. With a `timezone` it is written as local time plus a `TZID`."""
+    ics = main.build_vevent_ics("uid", TAIPEI_FIELDS)
+
+    assert "DTSTART;TZID=Asia/Taipei:20261006T100000" in ics
+    assert "DTEND;TZID=Asia/Taipei:20261006T120000" in ics
+    assert "DTSTART:2026" not in ics and "DTEND:2026" not in ics
+    assert "BEGIN:VTIMEZONE\r\nTZID:Asia/Taipei" in ics
+    assert "TZOFFSETTO:+0800" in ics
+
+
+def test_a_timezone_event_reads_back_as_wall_clock_plus_zone():
+    ics = main.build_vevent_ics("uid", TAIPEI_FIELDS)
+    parsed = main.parse_vevent_block(main.extract_blocks(main.unfold_ical_lines(ics), "VEVENT")[0])
+
+    assert parsed["start"] == {"value": "2026-10-06T10:00:00", "all_day": False, "timezone": "Asia/Taipei"}
+    assert parsed["end"] == {"value": "2026-10-06T12:00:00", "all_day": False, "timezone": "Asia/Taipei"}
+
+
+def test_the_timezone_changes_the_representation_not_the_instant():
+    """An offset that differs from the zone's own is converted, not reinterpreted."""
+    ics = main.build_vevent_ics(
+        "uid", {"summary": "x", "start": "2026-10-06T02:00:00Z", "end": "2026-10-06T04:00:00Z", "timezone": "Asia/Taipei"}
+    )
+    assert "DTSTART;TZID=Asia/Taipei:20261006T100000" in ics
+
+
+def test_the_default_timezone_applies_unless_a_call_names_its_own():
+    original = main.CALDAV_DEFAULT_TIMEZONE
+    main.CALDAV_DEFAULT_TIMEZONE = "Asia/Taipei"
+    try:
+        fields = {k: v for k, v in TAIPEI_FIELDS.items() if k != "timezone"}
+        assert "DTSTART;TZID=Asia/Taipei:20261006T100000" in main.build_vevent_ics("uid", fields)
+        tokyo = main.build_vevent_ics("uid", {**fields, "timezone": "Asia/Tokyo"})
+        assert "DTSTART;TZID=Asia/Tokyo:20261006T110000" in tokyo
+    finally:
+        main.CALDAV_DEFAULT_TIMEZONE = original
+
+
+def test_without_any_timezone_events_are_still_stored_as_utc():
+    fields = {k: v for k, v in TAIPEI_FIELDS.items() if k != "timezone"}
+    ics = main.build_vevent_ics("uid", fields)
+    assert "DTSTART:20261006T020000Z" in ics
+    assert "VTIMEZONE" not in ics
+
+
+def test_a_timezone_does_not_touch_an_all_day_event():
+    ics = main.build_vevent_ics("uid", {"summary": "x", "start": "2026-10-06", "timezone": "Asia/Taipei"})
+    assert "DTSTART;VALUE=DATE:20261006" in ics
+    assert "VTIMEZONE" not in ics
+
+
+def test_an_unknown_timezone_is_rejected_by_name():
+    try:
+        main.build_vevent_ics("uid", {**TAIPEI_FIELDS, "timezone": "Mars/Olympus"})
+    except ValueError as exc:
+        assert "Mars/Olympus" in str(exc)
+    else:
+        raise AssertionError("an unknown timezone was not rejected")
+
+
+def test_end_before_start_is_still_rejected_in_a_named_timezone():
+    try:
+        main.build_vevent_ics("uid", {**TAIPEI_FIELDS, "end": "2026-10-06T09:00:00+08:00"})
+    except ValueError as exc:
+        assert "earlier" in str(exc)
+    else:
+        raise AssertionError("end before start slipped through when a timezone was set")
+
+
+def test_the_timezone_reaches_the_catalogue_schema_of_create_and_update():
+    for name in ("caldav_create_event", "caldav_update_event"):
+        assert "timezone" in main.BUILTIN_OPERATIONS[name].input_schema["properties"]
+
+
 def test_update_event_keeps_the_original_created_time():
     """An update is a full replace, but the event was not created again - CREATED
     must survive it while LAST-MODIFIED moves forward."""

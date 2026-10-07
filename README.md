@@ -120,19 +120,20 @@ Publishing ~545 tools costs ~101,000 tokens of context per session (measured: 40
 
 All settings are environment variables.
 
-| Variable                    | Default                | Description                                                                                                 |
-|-----------------------------|------------------------|-------------------------------------------------------------------------------------------------------------|
-| `NEXTCLOUD_URL`             | `http://nc31-app-1:80` | Base URL of your Nextcloud. **Always set this** - the default is only a placeholder.                        |
-| `NEXTCLOUD_USERNAME`        | unset                  | Account for startup discovery (and for `stdio` execution)                                                   |
-| `NEXTCLOUD_APP_TOKEN`       | unset                  | App token for the above                                                                                     |
-| `MCP_TRANSPORT`             | `streamable-http`      | `streamable-http` or `stdio`                                                                                |
-| `MCP_HOST` / `MCP_PORT`     | `0.0.0.0` / `8000`     | Bind address for HTTP mode                                                                                  |
-| `DISCOVERY_TIMEOUT_SECONDS` | `30`                   | Timeout for discovery and proxied requests                                                                  |
-| `DISCOVERY_RETRY_SECONDS`   | `60`                   | How long a failed discovery is cached before retrying                                                       |
-| `TOOL_LIST_TTL_MS`          | `300000`               | `ttlMs` cache hint on `tools/list`                                                                          |
-| `CORS_ALLOW_ORIGINS`        | unset                  | Comma-separated origins for **browser-based** clients (`*` allows all). CLI and native clients ignore CORS. |
-| `LOG_LEVEL`                 | `INFO`                 | Python log level                                                                                            |
-| `DEBUG`                     | unset                  | `true` enables Starlette debug mode                                                                         |
+| Variable                    | Default                | Description                                                                                                                                      |
+|-----------------------------|------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------|
+| `NEXTCLOUD_URL`             | `http://nc31-app-1:80` | Base URL of your Nextcloud. **Always set this** - the default is only a placeholder.                                                             |
+| `NEXTCLOUD_USERNAME`        | unset                  | Account for startup discovery (and for `stdio` execution)                                                                                        |
+| `NEXTCLOUD_APP_TOKEN`       | unset                  | App token for the above                                                                                                                          |
+| `MCP_TRANSPORT`             | `streamable-http`      | `streamable-http` or `stdio`                                                                                                                     |
+| `MCP_HOST` / `MCP_PORT`     | `0.0.0.0` / `8000`     | Bind address for HTTP mode                                                                                                                       |
+| `DISCOVERY_TIMEOUT_SECONDS` | `30`                   | Timeout for discovery and proxied requests                                                                                                       |
+| `DISCOVERY_RETRY_SECONDS`   | `60`                   | How long a failed discovery is cached before retrying                                                                                            |
+| `TOOL_LIST_TTL_MS`          | `300000`               | `ttlMs` cache hint on `tools/list`                                                                                                               |
+| `CORS_ALLOW_ORIGINS`        | unset                  | Comma-separated origins for **browser-based** clients (`*` allows all). CLI and native clients ignore CORS.                                      |
+| `CALDAV_DEFAULT_TIMEZONE`   | unset                  | IANA zone (e.g. `Asia/Taipei`) CalDAV events are stored in; unset stores UTC, which clients show as UTC+0. See [docs/caldav.md](docs/caldav.md). |
+| `LOG_LEVEL`                 | `INFO`                 | Python log level                                                                                                                                 |
+| `DEBUG`                     | unset                  | `true` enables Starlette debug mode                                                                                                              |
 
 ## Authentication
 
@@ -168,7 +169,7 @@ Apps whose document fails to load are skipped with a warning. If discovery fails
 
 ## Known limitations
 
-- CalDAV operations were verified against a live Nextcloud (create/list/get/update/delete for calendars and events, ETag guards, recurring-event windows, cross-calendar listing). They handle `VEVENT` only and don't parse `VTIMEZONE`; event times are returned in UTC.
+- CalDAV operations were verified against a live Nextcloud (create/list/get/update/delete for calendars and events, ETag guards, recurring-event windows, cross-calendar listing). They handle `VEVENT` only and don't parse `VTIMEZONE`; events are stored as UTC unless `timezone` / `CALDAV_DEFAULT_TIMEZONE` is set.
 - Writes to read-only shared calendars, and dated recurrence exceptions (`override_count` > 0), have not been tested.
 - Most other `POST`/`PUT`/`DELETE` operations in the catalogue are untested.
 - Proxying against a real instance is not covered by the automated tests.

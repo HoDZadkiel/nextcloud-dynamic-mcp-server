@@ -8,6 +8,7 @@ services:
       NEXTCLOUD_URL: "https://nextcloud.example.com"   # or http://host.docker.internal:8080 for local dev
       NEXTCLOUD_USERNAME: "your-username"
       NEXTCLOUD_APP_TOKEN: "your-app-token"
+      # CALDAV_DEFAULT_TIMEZONE: "Asia/Taipei"   # store calendar events in this zone instead of UTC
       # CORS_ALLOW_ORIGINS: "https://your-browser-mcp-client.example.com"
     networks:
       - testnet
