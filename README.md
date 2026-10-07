@@ -2,213 +2,61 @@
 
 Exposes a live Nextcloud instance as an MCP server, reflecting whatever apps that instance actually has installed.
 
-Instead of shipping a fixed tool list, this server queries the Nextcloud `ocs_api_viewer` app at startup, reads the OpenAPI description of each installed app, and turns those operations into a searchable catalogue. Point it at a Nextcloud with 28 apps enabled and all ~545 operations those apps expose become callable - no per-app integration code.
+At startup the server reads the OpenAPI description of every installed app from Nextcloud's `ocs_api_viewer` app and turns those operations into a searchable catalogue. An instance with 28 apps exposes ~545 operations - no per-app integration code. The catalogue is published as **four fixed tools** (~760 tokens of client context instead of ~101,000).
 
-The catalogue is published as a handful of fixed tools rather than one tool per operation, so a client spends about 760 tokens of context on this server instead of ~101,000.
+Speaks MCP protocol revision `2026-07-28`, and still answers older handshake revisions.
 
-Speaks MCP protocol revision `2026-07-28` (the stateless core) and still answers the older handshake revisions for clients that have not migrated.
+> [!WARNING]
+> The CalDAV calendar operations have **not** been run against a live Nextcloud, and most write operations (`POST`/`PUT`/`DELETE`) in the catalogue are untested. Try them on a test instance first. See [Known limitations](#known-limitations).
 
----
-
-## Attribution
-
-This is a fork of **[Rello/nextcloud-dynamic-mcp-server](https://github.com/Rello/nextcloud-dynamic-mcp-server)** by [@Rello](https://github.com/Rello), which is where the dynamic-discovery design and the original implementation come from. Credit for the idea and the working foundation belongs there.
-
-The upstream repository **publishes no license file**. Absent a license, default copyright applies and the terms of reuse are the upstream author's to set - this fork does not add a license of its own, and downstream users should take that up with upstream rather than assume permission from this repository.
-
-See [What This Fork Changes](#what-this-fork-changes) for the delta.
-
----
-
-## What The Server Does
-
-- Connects to the Nextcloud instance defined by `NEXTCLOUD_URL`
-- Reads installed app APIs from `NEXTCLOUD_URL/apps/ocs_api_viewer`
-- Builds a searchable operation catalogue from the discovered OpenAPI documents
-- Proxies calls back to the real Nextcloud REST endpoints
-- Uses server-side credentials for discovery and per-caller credentials for execution
-- Supports both `streamable-http` and `stdio` transports
-
-Operations are named from the Nextcloud app id plus the OpenAPI operation id:
-
-```text
-files_sharing_get_shares
-provisioning_api_create_user
-dav_upcoming_events_get_events
-```
-
-## Tools
-
-The server publishes four tools, whatever the connected instance has installed:
-
-- **`nextcloud_find_operations`** - search the catalogue by free text and/or app id. Returns each match's name, HTTP method, path and summary. For a credentialed caller its own description also carries the app index (`collectives:84, spreed:142, ...`), so a client knows what exists before searching.
-- **`nextcloud_describe_operations`** - the full JSON Schema for one or more operations, so their arguments can be filled in. Takes a list, so a whole task's operations can be fetched in one call.
-- **`nextcloud_call_operation`** - execute one operation by name with an `arguments` object.
-- **`nextcloud_discovery_status`** - auth mode, operation count, and last refresh state. A credentialed caller also gets the connected instance URL, the discovered-app inventory and the raw discovery error. Pass `{"refresh": true}` (credentials required) to re-run discovery first.
-Every tool except `nextcloud_discovery_status` requires the caller's credentials; see [Authentication](#authentication).
-
-A typical first use is `find` → `describe` → `call`. An unknown or near-miss operation name comes back with a `did_you_mean` list rather than an error, so a wrong guess costs one round trip instead of a failed task.
-
-### WebDAV
-
-Five `webdav_*` operations are the one hand-written part of the catalogue. Everything else on this server is reflected from `ocs_api_viewer`, and that describes the **OCS API only** - which serves metadata about files but never their bytes. `collectives_page_get` reports that a page is 2,739 bytes and what it is called; nothing in the catalogue returns the 2,739 bytes. `files` exposes sixteen OCS operations and not one of them downloads a file, creates an ordinary folder, or deletes anything; `files_api_get_folder_tree` lists folders but omits the files inside them. Page bodies live at `/remote.php/dav/files/<user>/…`, outside anything discovery can see.
-
-They are registered as catalogue entries rather than as tools of their own, so `nextcloud_find_operations` finds them beside the discovered ones, `nextcloud_describe_operations` returns their schemas, and `nextcloud_call_operation` runs them. The fixed surface stays at four tools, and each operation's warnings arrive from `describe` at the moment of use instead of sitting in every client's context for the whole session. Because nothing discovers them, `find`'s own description lists `webdav` in its app index; searching `delete folder` also ranks `webdav_delete` first without knowing the app name.
-
-Rather than teach the server about Collectives, the gap is closed with generic file operations. A page body is just a file, so the app-agnostic primitive covers it and everything else, and the server keeps its property of having no per-app integration code. Composing a page's path is the caller's job, from fields its own index entry already returns:
-
-```text
-{collectivePath}/{filePath}/{fileName}      # filePath is often empty
-.Collectives/研究筆記/第一章 概論/背景.md
-```
-
-All five run under the caller's own credentials - `nextcloud_call_operation` refuses an uncredentialed caller whichever operation it names - so they reach exactly the files that caller can reach. Paths are confined to that user's files root: `.` and `..` segments are rejected rather than normalised, because Basic auth stops a caller reaching another user's files but would not stop a traversal climbing out of `files/<user>/` into the other DAV endpoints.
-
-`webdav_write_file` replaces the whole file. Read first, send the `etag` back as `if_match`, and a write computed from stale content fails with 412 instead of silently discarding whatever changed in between. It will not create parent folders on its own - use `webdav_create_folder`, or for a Collectives page create it with `collectives_page_create` and write the body afterwards.
-
-Binary goes through `content_base64`, because reads hand binary back base64-encoded and feeding that into the text field would write the base64 itself, then encode it again on the next read - a silent round-trip corruption that reports success at every step.
-
-`webdav_delete` refuses a folder unless `recursive` is set: WebDAV DELETE on a collection always takes everything inside and has no shallow variant, so the resource is inspected first rather than letting a mistyped path remove a subtree. Deletions land in the Nextcloud trash bin.
-
-Three behaviours here were corrected only after testing against a real instance rather than reasoning from the specification:
-
-- A write below a missing folder answers **404**, not the 409 the WebDAV spec implies, so guidance keyed on 409 never appeared.
-- `GET` on a folder returns **200** with the HTML placeholder Nextcloud serves for a collection, which made a mistyped path look like a successfully read file. Files always carry an ETag and that page never does, which is how the two are told apart.
-- ETags come back with a `-gzip` (or `-br`, `-deflate`, `-zstd`) suffix whenever the response is compressed, while the entity's real validator has none. Handing the suffixed value back as `If-Match` failed with 412 while nothing had changed, and re-reading returned the same suffixed value - an unbreakable loop. It only bites on responses large enough to compress, so small test files never showed it.
-
-### Calendar
-
-Eight `caldav_*` operations close the same gap for calendars that WebDAV closes for files. Nextcloud's calendar app is CalDAV ([RFC 4791](https://www.rfc-editor.org/rfc/rfc4791)) end to end - there is no OCS REST API for it, so `ocs_api_viewer` has nothing to discover here. `dav_upcoming_events_get_events`, the one calendar-adjacent operation that *is* discovered, only powers the dashboard widget's next few events and offers no create/update/delete path.
-
-They cover calendars (`caldav_list_calendars`, `caldav_create_calendar`, `caldav_delete_calendar`) and events (`caldav_list_events`, `caldav_get_event`, `caldav_create_event`, `caldav_update_event`, `caldav_delete_event`). Only `VEVENT` (ordinary calendar events) is handled - `VTODO` and `VJOURNAL` entries are neither returned nor created.
-
-Event identity follows the same rule [sabre/dav](https://sabre.io/dav/building-a-caldav-client/) - the CalDAV library Nextcloud's server is built on - documents for its own clients: a calendar object's filename is not guaranteed to match its `UID`. Every operation that addresses one event therefore takes the `path` a prior `caldav_list_events`, `caldav_get_event` or `caldav_create_event` already returned, never one composed by hand - the same pattern `webdav_*` uses for file paths.
-
-`caldav_update_event` is a full replace, like `webdav_write_file`: read the event with `caldav_get_event` first, apply the change to what it returned, and send everything back - fields left out are cleared, not preserved. Pass the `etag` back as `if_match` and a write computed from a stale read fails with 412 instead of discarding a concurrent edit, the same guard `webdav_write_file` uses.
-
-`caldav_list_events` defaults to a 90-day window from now (`time_min`/`time_max` override it, `all_time` lifts it) because a CalDAV `REPORT` has no pagination - an unbounded query against a calendar with years of recurring events could return all of it. A recurring event is returned once, as its master; `override_count` says how many dated exceptions exist without expanding them, and `rrule` is passed through as a raw RFC 5545 value rather than translated from natural language.
-
-Times need a UTC offset or `Z` - `2026-09-20T14:00:00+08:00`, not a bare local datetime - because CalDAV has no notion of which timezone the caller means. Reading back a time the server tagged with an IANA zone (`TZID=Asia/Taipei`) returns the wall-clock value plus that zone name rather than converting it to an absolute instant; this server does not parse `VTIMEZONE` tables, so treat a returned event's `timezone` field as informational.
-
-**Not verified against a live instance.** Unlike WebDAV - which surfaced three real quirks only visible against a running Nextcloud (see above) - the CalDAV operations were built from RFC 4791/5545 and sabre/dav's own documentation, and exercised only against synthetic fixtures in `test_main.py`. Validate against a real calendar before relying on them, especially `caldav_create_calendar`'s `color` property (an Apple/CalendarServer extension, not part of RFC 4791, that most servers including Nextcloud accept but nothing guarantees) and calendar deletion, which is treated as permanent here because this server has not confirmed whether Nextcloud's calendar trash retention actually catches it.
-
-### Why Not One Tool Per Operation
-
-An instance with every app enabled discovers ~545 operations. Publishing those as ~545 MCP tools puts their full input schemas into the context of every client on every session - measured against a live instance, 403,875 characters, roughly **101,000 tokens**, before a single call is made. No session uses more than a handful of them.
-
-The fixed surface costs **~760 tokens**, a 99.2% reduction, and a realistic `find` + `describe` round trip adds ~310 tokens. Ten operations looked up on demand still cost an order of magnitude less than the old tool list.
-
-The trade is one extra round trip before an unfamiliar operation, and no client-side schema validation on `nextcloud_call_operation` - the `arguments` object is passed through as given, so `describe` is what keeps a call well-formed.
+This is a fork of [Rello/nextcloud-dynamic-mcp-server](https://github.com/Rello/nextcloud-dynamic-mcp-server); see [Attribution](#attribution).
 
 ## Quick Start
 
-Requires Docker, a reachable Nextcloud, the `ocs_api_viewer` app enabled on it, and a Nextcloud username plus app token.
+### 1. Prepare Nextcloud
 
-Put your instance URL and credentials into `docker-compose.yml`, then:
+1. Install and enable the **OCS API Viewer** (`ocs_api_viewer`) app from the Nextcloud App Store. Discovery fails without it.
+2. Create an app token: **Personal settings → Security → Devices & sessions → Create new app password**. Use a regular user's token, not your main password.
+
+### 2. Configure
+
+Edit `docker-compose.yml`:
+
+```yaml
+NEXTCLOUD_URL: "https://nextcloud.example.com"   # your instance, reachable from the container
+NEXTCLOUD_USERNAME: "your-username"
+NEXTCLOUD_APP_TOKEN: "your-app-token"
+```
+
+The compose file attaches to an external Docker network named `testnet`. Create it once, or remove the `networks:` entries if you don't need it:
+
+```bash
+docker network create testnet
+```
+
+### 3. Run
 
 ```bash
 docker compose up -d --build
+curl http://localhost:8000/        # health check
 ```
 
-The server comes up at `http://localhost:8000/` (health) and `http://localhost:8000/mcp` (MCP).
+The MCP endpoint is `http://localhost:8000/mcp`.
 
-## Endpoints
-
-### `GET /`
-
-Health endpoint. Returns the server name and version, the MCP path, whether discovery credentials are configured, whether the last discovery succeeded, and the app/tool counts.
-
-It deliberately does **not** return the Nextcloud URL, the installed-app inventory, or discovery error text. This endpoint is reachable cross-origin and those fields describe an internal instance; call the `nextcloud_discovery_status` tool **with credentials** for the full picture.
+**Without Docker:**
 
 ```bash
-curl http://localhost:8000/
+pip install -r requirements.txt
+NEXTCLOUD_URL=... NEXTCLOUD_USERNAME=... NEXTCLOUD_APP_TOKEN=... python main.py
 ```
 
-### `POST /mcp`
+Set `MCP_TRANSPORT=stdio` to run as a local stdio server instead of HTTP.
 
-The MCP endpoint for `streamable-http` clients.
+### 4. Connect a client
 
-## Configuration
+Each user sends **their own** Nextcloud credentials as headers, so one shared server URL is safe for a whole team.
 
-Entirely environment variables.
-
-| Variable | Default | Description |
-|---|---|---|
-| `NEXTCLOUD_URL` | `http://nc31-app-1:80` | Base URL of the target Nextcloud instance |
-| `NEXTCLOUD_USERNAME` | unset | Username used for startup discovery (and for `stdio` execution) |
-| `NEXTCLOUD_APP_TOKEN` | unset | App token used for startup discovery (and for `stdio` execution) |
-| `MCP_HOST` | `0.0.0.0` | Bind host for HTTP mode |
-| `MCP_PORT` | `8000` | Bind port for HTTP mode |
-| `MCP_TRANSPORT` | `streamable-http` | `streamable-http` or `stdio` |
-| `DISCOVERY_TIMEOUT_SECONDS` | `30` | Timeout for discovery and proxied requests |
-| `DISCOVERY_RETRY_SECONDS` | `60` | How long a failed discovery is cached before it is retried |
-| `TOOL_LIST_TTL_MS` | `300000` | `ttlMs` cache hint sent with `tools/list` results |
-| `CORS_ALLOW_ORIGINS` | unset | Comma-separated browser origins allowed to read responses. `*` allows all |
-| `LOG_LEVEL` | `INFO` | Python log level |
-| `DEBUG` | unset | `true` enables Starlette debug mode |
-
-### Browser Origins
-
-`CORS_ALLOW_ORIGINS` only affects MCP clients running **inside a browser**. CORS is enforced by browsers, so command-line and native clients - Codex, Claude Code, anything using an HTTP library - ignore this setting entirely and need no configuration.
-
-Unset means no cross-origin page can read this server's responses. Set it only if you have a browser-based client.
-
-## Authentication
-
-Two credential paths, deliberately separated:
-
-| Path | Credentials | Used for |
-|---|---|---|
-| Discovery | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Reading the API catalogue at startup |
-| Execution (HTTP) | `X-Nextcloud-Username` / `X-Nextcloud-AppToken` request headers | Every proxied tool call |
-| Execution (stdio) | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Every proxied tool call |
-
-Over HTTP the server **never** falls back to the discovery account for execution. A tool call without credential headers is rejected, so one shared server URL can never let one caller act as another. This is what makes a single deployment safe for a team: everyone points at the same URL and authenticates as themselves.
-
-Discovery is gated to the same degree. The catalogue names every app the instance has installed and every API path it exposes, so `nextcloud_find_operations` and `nextcloud_describe_operations` reject an uncredentialed caller exactly as `nextcloud_call_operation` does, and `nextcloud_discovery_status` withholds the instance URL and app inventory. `tools/list` itself stays open, because a client that cannot list tools cannot connect at all - what it returns to an anonymous caller is the fixed tool names and no instance detail.
-
-Because MCP clients configure these as transport headers, they are sent on every request including `tools/list`; a client that cannot send them could not execute anything anyway.
-
-Over `stdio` there are no HTTP headers and the process serves exactly one local client, so the configured account *is* that caller's account.
-
-Proxied responses return only a safe subset of upstream response headers (`content-type`, `content-length`, `etag`, `last-modified`, `location`, `retry-after`). Nextcloud answers every Basic-auth request with a `Set-Cookie` session passphrase; forwarding it would drop a live session token into the MCP client's conversation history.
-
-## How Discovery Works
-
-At startup the server:
-
-1. Calls `GET /apps/ocs_api_viewer/apps`
-2. Loads each app's OpenAPI document from `GET /apps/ocs_api_viewer/apps/{appId}`
-3. Builds an MCP input schema from each operation's parameters and request body, inlining any `$ref` against that document's `components` so the schema is self-contained
-4. Registers the operation as a callable MCP tool
-
-Apps whose OpenAPI document fails to load are skipped with a warning; the rest still register.
-
-If discovery fails entirely the server still starts and reports the error through `nextcloud_discovery_status`. Failures expire after `DISCOVERY_RETRY_SECONDS`, so a server that started before Nextcloud was reachable recovers on its own. `nextcloud_discovery_status` with `{"refresh": true}` forces an immediate retry.
-
-## Client Configuration
-
-### Codex
-
-```bash
-codex mcp add nextcloud-live --url http://localhost:8000/mcp
-```
-
-Equivalent `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.nextcloud-live]
-url = "http://localhost:8000/mcp"
-http_headers = { X-Nextcloud-Username = "NEXTCLOUD_USERNAME", X-Nextcloud-AppToken = "NEXTCLOUD_APP_TOKEN" }
-```
-
-### Claude Code
-
-```bash
-claude mcp add --transport http nextcloud-live http://localhost:8000/mcp
-```
-
-Project-scoped `.mcp.json`, taking each developer's own credentials from their environment:
+**Claude Code** (`.mcp.json`, credentials taken from each developer's environment):
 
 ```json
 {
@@ -225,88 +73,114 @@ Project-scoped `.mcp.json`, taking each developer's own credentials from their e
 }
 ```
 
-## Smoke Checks
+**Codex** (`~/.codex/config.toml`):
 
-```bash
-curl http://localhost:8000/
+```toml
+[mcp_servers.nextcloud-live]
+url = "http://localhost:8000/mcp"
+http_headers = { X-Nextcloud-Username = "your-username", X-Nextcloud-AppToken = "your-app-token" }
 ```
 
-```bash
-docker compose logs -f mcp
-```
+> [!IMPORTANT]
+> The token travels in an HTTP header. For anything beyond localhost, put the server behind an HTTPS reverse proxy.
 
-Then call `nextcloud_discovery_status` from your MCP client and confirm the app inventory matches your enabled apps, and `nextcloud_find_operations` with a term like `share` to confirm the catalogue is populated.
+### 5. Verify
+
+Call `nextcloud_discovery_status` from your client and check the app list matches your instance, then `nextcloud_find_operations` with a term like `share`.
+
+## Tools
+
+Four tools, whatever the instance has installed:
+
+| Tool | Purpose |
+|---|---|
+| `nextcloud_find_operations` | Search the catalogue by free text and/or app id. |
+| `nextcloud_describe_operations` | Full JSON Schema for one or more operations. |
+| `nextcloud_call_operation` | Run one operation by name with an `arguments` object. |
+| `nextcloud_discovery_status` | Auth mode, operation count, last refresh. With credentials: instance URL, app inventory, raw error. `{"refresh": true}` re-runs discovery. |
+
+Typical flow: **find → describe → call**. A wrong or near-miss operation name returns a `did_you_mean` list instead of failing.
+
+Operation names are the app id plus the OpenAPI operation id, e.g. `files_sharing_get_shares`, `provisioning_api_create_user`.
+
+Every tool except `nextcloud_discovery_status` requires the caller's credentials.
+
+### Files and calendars
+
+OCS discovery cannot read file contents or touch calendars, so the catalogue also contains hand-written operations that run with the caller's own credentials:
+
+- **`webdav_*`** (5 operations) - read, write, list, create folder, delete files. Details: [docs/webdav.md](docs/webdav.md)
+- **`caldav_*`** (8 operations) - list/create/delete calendars; list/get/create/update/delete events. Details: [docs/caldav.md](docs/caldav.md)
+
+### Why a catalogue instead of one tool per operation
+
+Publishing ~545 tools costs ~101,000 tokens of context per session (measured: 403,875 characters of schema), though a session uses only a handful. The four fixed tools cost ~760 tokens; a typical find + describe round trip adds ~310. The trade-off: one extra round trip before an unfamiliar operation, and no client-side validation of `arguments` - `describe` is what keeps a call well-formed.
+
+## Configuration
+
+All settings are environment variables.
+
+| Variable | Default | Description |
+|---|---|---|
+| `NEXTCLOUD_URL` | `http://nc31-app-1:80` | Base URL of your Nextcloud. **Always set this** - the default is only a placeholder. |
+| `NEXTCLOUD_USERNAME` | unset | Account for startup discovery (and for `stdio` execution) |
+| `NEXTCLOUD_APP_TOKEN` | unset | App token for the above |
+| `MCP_TRANSPORT` | `streamable-http` | `streamable-http` or `stdio` |
+| `MCP_HOST` / `MCP_PORT` | `0.0.0.0` / `8000` | Bind address for HTTP mode |
+| `DISCOVERY_TIMEOUT_SECONDS` | `30` | Timeout for discovery and proxied requests |
+| `DISCOVERY_RETRY_SECONDS` | `60` | How long a failed discovery is cached before retrying |
+| `TOOL_LIST_TTL_MS` | `300000` | `ttlMs` cache hint on `tools/list` |
+| `CORS_ALLOW_ORIGINS` | unset | Comma-separated origins for **browser-based** clients (`*` allows all). CLI and native clients ignore CORS. |
+| `LOG_LEVEL` | `INFO` | Python log level |
+| `DEBUG` | unset | `true` enables Starlette debug mode |
+
+## Authentication
+
+| Path | Credentials | Used for |
+|---|---|---|
+| Discovery | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Reading the API catalogue at startup |
+| Execution (HTTP) | `X-Nextcloud-Username` / `X-Nextcloud-AppToken` headers | Every proxied call |
+| Execution (stdio) | `NEXTCLOUD_USERNAME` / `NEXTCLOUD_APP_TOKEN` | Every proxied call |
+
+- Over HTTP the server **never** falls back to the discovery account for execution, so callers cannot act as each other.
+- `find`, `describe`, `call` and the detailed `status` all reject uncredentialed callers, because the catalogue reveals installed apps and API paths. `tools/list` stays open (clients need it to connect) but shows only fixed tool names.
+- Over `stdio` there is one local client, so the configured account is that caller.
+- Only a safe subset of upstream response headers is returned; Nextcloud's `Set-Cookie` session token is never forwarded.
+- `GET /` (health) deliberately omits the Nextcloud URL, app inventory and error text.
+
+## How Discovery Works
+
+1. `GET /apps/ocs_api_viewer/apps` lists installed apps.
+2. Each app's OpenAPI document is loaded from `/apps/ocs_api_viewer/apps/{appId}`.
+3. Operations are turned into catalogue entries with self-contained input schemas (`$ref`s inlined).
+
+Apps whose document fails to load are skipped with a warning. If discovery fails entirely the server still starts; failures expire after `DISCOVERY_RETRY_SECONDS`, and `nextcloud_discovery_status` with `{"refresh": true}` forces a retry.
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `nextcloud_discovery_status` reports 0 operations | `ocs_api_viewer` not enabled, wrong `NEXTCLOUD_URL`, or bad discovery credentials. Check the status error and `docker compose logs -f mcp`. |
+| Tool call rejected for missing credentials | Client isn't sending `X-Nextcloud-Username` / `X-Nextcloud-AppToken`. |
+| `docker compose up` fails on network `testnet` | Run `docker network create testnet`, or remove the `networks:` entries. |
+| Container can't reach Nextcloud | `NEXTCLOUD_URL` must be reachable from inside the container (not `localhost`; try `http://host.docker.internal:<port>`). |
+| Browser client blocked | Set `CORS_ALLOW_ORIGINS`. |
+
+## Known limitations
+
+- CalDAV operations are untested against a live Nextcloud, handle `VEVENT` only, and don't parse `VTIMEZONE`.
+- Most `POST`/`PUT`/`DELETE` operations in the catalogue are untested.
+- Proxying against a real instance is not covered by the automated tests.
 
 ## Tests
 
 ```bash
 pip install -r requirements-dev.txt
-```
-
-```bash
 pytest
 ```
 
-Covers schema generation (including `$ref` inlining), credential handling, discovery retry, catalogue search and description, the `2026-07-28` protocol surface (`server/discover`, cache hints, per-request auth), the WebDAV file operations, and the CalDAV calendar/event operations (iCalendar escaping/folding round trips, PROPFIND/REPORT XML parsing against fixtures, ETag/`If-Match` handling) against the in-process ASGI app.
+## Attribution
 
-**Not covered:** proxying against a real Nextcloud instance, and any write-path operation. The catalogue includes a large number of `POST`/`PUT`/`DELETE` operations that have not been exercised - validate those against a test instance before relying on them. The CalDAV operations specifically have not been run against a live Nextcloud calendar at all; see [Calendar](#calendar).
+Fork of [Rello/nextcloud-dynamic-mcp-server](https://github.com/Rello/nextcloud-dynamic-mcp-server) by [@Rello](https://github.com/Rello), where the dynamic-discovery design and original implementation come from. See [CHANGELOG.md](CHANGELOG.md) for what this fork changes.
 
-## What This Fork Changes
-
-Relative to [Rello/nextcloud-dynamic-mcp-server](https://github.com/Rello/nextcloud-dynamic-mcp-server) at commit `bc2c042`.
-
-### Migrated to MCP `2026-07-28` (SDK `mcp` 2.x)
-
-The upstream targets the pre-2.0 SDK and the stateful handshake protocol. This fork moves to the stateless core:
-
-- Handlers move from `@server.list_tools()` decorators to `Server(on_list_tools=..., on_call_tool=...)` constructor parameters
-- Results are constructed explicitly rather than auto-wrapped
-- The per-request `contextvars` header shim and hand-rolled ASGI wrapper are gone; handlers read `ctx.request.headers` directly
-- `StreamableHTTPSessionManager` plus a manual Starlette app becomes `server.streamable_http_app()`
-- `tools/list` carries the `ttlMs` / `cacheScope` hints SEP-2549 requires
-- `server/discover` is provided by the SDK
-- Outbound HTTP moves from `httpx` to `httpx2`
-
-Older handshake-protocol clients still work; the transport routes by the `MCP-Protocol-Version` header.
-
-### Catalogue replaces the per-operation tool list
-
-Upstream registers one MCP tool per discovered operation. On a fully-loaded instance that is ~545 tools and ~101,000 tokens of `inputSchema` in every client's context, permanently, for a handful of actual calls. Roughly a third of it was not even schema: `dynamic_tool_description` prefixed every tool with the same two fixed sentences, ~98,000 characters of identical text across the list.
-
-This fork publishes four instead - `find` / `describe` / `call` plus the status tool - and searches the catalogue on demand. Measured against the same instance: ~760 tokens, 99.2% less. See [Why Not One Tool Per Operation](#why-not-one-tool-per-operation).
-
-**Breaking:** operation names are unchanged, but they are no longer MCP tool names. A client that called `collectives_page_create` directly now calls `nextcloud_call_operation` with `{"name": "collectives_page_create", "arguments": {...}}`, and per-tool permission allowlists need rewriting against the fixed tool names.
-
-### File contents, which discovery cannot reach
-
-`ocs_api_viewer` describes the OCS API, and the OCS API serves metadata about files but never their bytes. Upstream therefore cannot read or write a file at all: `collectives_page_get` reports a page's size and filename, `files` exposes sixteen operations, and none of them returns content. For a Collectives instance that means the whole point of the knowledge base - the pages - is unreachable.
-
-Added five WebDAV operations - read, write, list, create folder, delete - speaking with the caller's own credentials. They are generic file access rather than Collectives-aware, so the server keeps its defining property of having no per-app integration code. Several of their behaviours were corrected only after testing against a real instance; see [WebDAV](#webdav).
-
-### Calendar access, which discovery cannot reach either
-
-Calendars are CalDAV, not an OCS REST API, so upstream cannot list a calendar, read an event, or create/update/delete one - the one discovered calendar-adjacent operation only feeds the dashboard's upcoming-events widget. Added eight `caldav_*` operations - list/create/delete calendars, list/get/create/update/delete events - speaking with the caller's own credentials, following RFC 4791/5545. See [Calendar](#calendar) for what they cover and what has not been verified against a live instance.
-
-### Security fixes
-
-- **Session token leak.** Proxied responses returned `dict(response.headers)`, which includes the `Set-Cookie` session passphrase Nextcloud issues on every Basic-auth request - putting a live session token into the MCP conversation. Now filtered to a safe allowlist.
-- **Auth header override.** An OpenAPI header parameter named `Authorization` became a tool argument that overwrote the caller's credentials. Now filtered alongside `OCS-APIRequest`.
-- **Open CORS.** `allow_origins` was pinned to `["*"]`. Now driven by `CORS_ALLOW_ORIGINS`, closed by default.
-- **Health endpoint disclosure.** `GET /` returned the internal Nextcloud URL, the API-viewer URL, the installed-app inventory, and raw discovery error text to any origin. Trimmed to non-sensitive fields.
-- **Unauthenticated discovery.** Execution was credentialed from the start, but nothing else was. `nextcloud_discovery_status` was dispatched before any credential check, so an anonymous caller got the internal Nextcloud URL and the full app inventory - the very fields `GET /` had just been trimmed of, which made that trimming pointless. Searching the catalogue was open too, `{"refresh": true}` let anyone turn one request into a full re-discovery against Nextcloud using the server's own credentials, and because the unknown-operation branch ran before the credential check its `did_you_mean` list could be used to enumerate operations one guess at a time. All four are now behind the caller's credentials.
-
-### Compatibility fixes
-
-- **Dangling `$ref` broke strict MCP clients.** Nextcloud's OpenAPI documents use `$ref: "#/components/schemas/X"` for recursive or reused fields (e.g. `files_template_create`'s `templateFields`, `spreed_room_create_room`'s `participants`, `tables_api_tables_create_from_scheme`'s `columns`/`views`). The old code copied these `$ref` pointers verbatim into each tool's `inputSchema`, but an MCP client only ever receives that one tool's schema - never the surrounding `components` section - so the pointer resolved to nothing. Claude Code tolerates unresolvable `$ref`s; opencode does not and fails to build a parser for the whole tool list. `build_input_schema` now inlines every `$ref` against the source document before publishing the schema, with cycle/depth guards (`MAX_REF_DEPTH`) in case a future Nextcloud release introduces a self-referential schema. This is generic JSON-Pointer resolution, not special-cased per app or operation - any `$ref` Nextcloud's OpenAPI output produces, now or after an upstream API change, is handled the same way.
-
-### Reliability fixes
-
-- **Discovery could stick permanently.** A failed discovery was cached forever, so a server that started before Nextcloud was reachable stayed toolless until manually restarted. Failures now expire after `DISCOVERY_RETRY_SECONDS`, guarded by a lock so retries cannot stampede, and `nextcloud_discovery_status` accepts `{"refresh": true}`.
-- **`stdio` could never execute a tool.** Every call demanded HTTP credential headers, which `stdio` has no way to supply - so the advertised `stdio` transport was execution-dead. It now uses the configured account, which is the sole local caller. HTTP keeps the strict no-fallback rule.
-- **Container start command was inconsistent.** The Dockerfile ran `uvicorn main:app` while Compose overrode it with `python main.py`. Running the image directly therefore ignored `MCP_TRANSPORT`, `MCP_HOST`, and `MCP_PORT`, and `MCP_TRANSPORT=stdio` silently did nothing. Both now use `python main.py`.
-
-### Added
-
-- `test_main.py` - 107 tests
-- `.gitignore`, `requirements-dev.txt`
-- `DEVLOG.md` - change log and open items
+The upstream repository **publishes no license**, so default copyright applies. **This repository has no license file either** and does not grant one; take reuse questions up with the upstream author.

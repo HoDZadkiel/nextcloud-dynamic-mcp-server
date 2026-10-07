@@ -5,9 +5,9 @@ services:
     ports:
       - "8000:8000"
     environment:
-      NEXTCLOUD_URL: "http://nc32-app-1:80"   # or http://host.docker.internal:8031 for local dev
-      NEXTCLOUD_USERNAME: "NEXTCLOUD_USERNAME"
-      NEXTCLOUD_APP_TOKEN: "NEXTCLOUD_APP_TOKEN"
+      NEXTCLOUD_URL: "https://nextcloud.example.com"   # or http://host.docker.internal:8080 for local dev
+      NEXTCLOUD_USERNAME: "your-username"
+      NEXTCLOUD_APP_TOKEN: "your-app-token"
       # CORS_ALLOW_ORIGINS: "https://your-browser-mcp-client.example.com"
     networks:
       - testnet
